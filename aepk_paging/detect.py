@@ -1,0 +1,2 @@
+"""Detection invariant skeleton."""
+
