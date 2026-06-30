@@ -59,6 +59,7 @@ class TierCostModel:
     coded_distortion_weight: float = 160.0
     eviction_distortion_weight: float = 1400.0
     coded_entropy_retention: float = 0.5
+    entropy_weight: float = 1.0  # isolates the Gibbs -T*S term for sensitivity study (#8); 1.0 = nominal
 
     @property
     def landauer_per_bit(self) -> float:
@@ -109,7 +110,7 @@ class TierCostModel:
         }
 
     def free_energy(self, energy: float, entropy_nats: float) -> float:
-        return float(energy - self.temperature_kt * entropy_nats)
+        return float(energy - self.entropy_weight * self.temperature_kt * entropy_nats)
 
     def choose_tier(self, page: KVPage, budget_bits: int) -> TierEstimate:
         feasible = [

@@ -77,6 +77,55 @@ def test_tightening_budget_demotes_in_attention_mass_order() -> None:
     assert tight.decisions["p0"].tier is ResidencyTier.EVICTED
 
 
+def _entropy_probe_page(mass: float, peaked: bool) -> KVPage:
+    # small page near the RESIDENT/CODED boundary so the (small) entropy term can be studied
+    K = np.ones((4, 4), dtype=np.float32) * 0.3
+    if peaked:
+        K[0] = 6.0  # one dominant token -> low attention entropy
+    V = np.ones((4, 4), dtype=np.float32) * 0.2
+    return KVPage(
+        page_id="probe",
+        layer=0,
+        token_range=(0, 4),
+        K=K,
+        V=V,
+        precision_tag="float32",
+        attention_mass=mass,
+    )
+
+
+def test_entropy_term_is_small_vs_energy_at_nominal_weight() -> None:
+    # #8 sensitivity: the Gibbs -kT*S term REFINES residency, it does not DRIVE it.
+    page = _entropy_probe_page(0.5, peaked=False)
+    est = TierCostModel().tier_estimates(page)[ResidencyTier.RESIDENT]
+
+    assert est.entropy_nats > 0.0
+    contribution = abs(1.0 * 1.0 * est.entropy_nats)  # entropy_weight * kT * S at nominal
+    assert contribution / abs(est.energy) < 0.5  # measured: entropy is a minor correction
+
+
+def test_entropy_free_energy_is_monotonic_in_entropy_weight() -> None:
+    page = _entropy_probe_page(0.5, peaked=False)
+    fes = [
+        TierCostModel(entropy_weight=w).tier_estimates(page)[ResidencyTier.RESIDENT].free_energy
+        for w in (0.0, 1.0, 2.0, 4.0)
+    ]
+    # F = E - w*kT*S with S > 0 -> strictly decreasing in w (entropy is active, not vestigial)
+    assert all(later < earlier for earlier, later in zip(fes, fes[1:]))
+
+
+def test_entropy_is_load_bearing_when_amplified() -> None:
+    # nominal entropy is negligible, but amplifying it CAN flip a tier -> the term is real.
+    page = _entropy_probe_page(0.5, peaked=False)
+    budget = TierCostModel().resident_bits(page)
+
+    nominal = TierCostModel(entropy_weight=0.0).choose_tier(page, budget).tier
+    amplified = TierCostModel(entropy_weight=120.0).choose_tier(page, budget).tier
+
+    assert nominal is ResidencyTier.CODED
+    assert amplified is ResidencyTier.RESIDENT
+
+
 def test_landauer_cost_counts_evicted_pages_and_settling_energy_never_increases() -> None:
     manager = ResidencyManager(cost_model=TierCostModel(temperature_kt=1.0))
     pages = phase5_pages()
