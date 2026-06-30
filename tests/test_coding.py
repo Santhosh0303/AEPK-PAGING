@@ -3,9 +3,13 @@ import pytest
 
 from aepk_paging.coding import (
     HammingSECDEDCode,
+    ReedSolomonCode,
+    ReedSolomonCodewords,
     UncorrectableError,
     encode_erasure_group,
+    encode_rs_erasure_group,
     recover_erasure,
+    recover_rs_erasure,
 )
 from aepk_paging.kv_page import KVPage
 from aepk_paging.lossy_tier import bit_flip, quantize_page
@@ -71,3 +75,64 @@ def test_secded_beyond_hamming_bound_detects_and_flags_without_miscorrection() -
     assert report.uncorrectable_ids == (quantized.page_id,)
     with pytest.raises(UncorrectableError):
         code.correct([corrupted])
+
+
+# --- Real / parametric Reed-Solomon (improvement #1) ---
+
+
+def test_rs_corrects_multi_symbol_errors_within_bound() -> None:
+    values = quantize_page(float_page(0), bit_width=8).K.values
+    code = ReedSolomonCode(t=3)
+    enc = code.encode_array(values)
+    cw = enc.codewords.copy()
+    cw[0, [5, 50, 200]] ^= np.array([0x7F, 0x33, 0x9A], dtype=np.uint8)  # 3 symbol errors <= t
+    recovered, n_errors = code.correct_array(
+        ReedSolomonCodewords(cw, enc.original_len, enc.shape, enc.dtype)
+    )
+
+    assert code.t == 3 and code.k == 255 - 6
+    assert np.array_equal(recovered, values)
+    assert n_errors >= 1
+
+
+def test_rs_beyond_error_bound_never_silently_returns_correct() -> None:
+    # Honest property: RS corrects <= t. Beyond t it may FAIL (UncorrectableError)
+    # OR silently mis-correct to a wrong codeword -- it never silently returns the
+    # TRUE values claiming success. (This is why the error code must be paired with
+    # the Phase-4 detection invariants, which catch mis-corrections the code won't.)
+    values = quantize_page(float_page(0), bit_width=8).K.values
+    code = ReedSolomonCode(t=2)
+    enc = code.encode_array(values)
+    cw = enc.codewords.copy()
+    cw[0, :40] ^= np.uint8(0xFF)  # ~40 symbol errors >> t=2
+
+    raised = False
+    recovered = None
+    try:
+        recovered, _ = code.correct_array(
+            ReedSolomonCodewords(cw, enc.original_len, enc.shape, enc.dtype)
+        )
+    except UncorrectableError:
+        raised = True
+
+    assert raised or not np.array_equal(recovered, values)
+
+
+def test_cauchy_rs_recovers_multiple_evicted_pages_bit_exact() -> None:
+    pages = [float_page(i) for i in range(4)]
+    group = encode_rs_erasure_group(pages, num_parity=3)
+
+    recovered = recover_rs_erasure(group, missing_page_ids=[0, 2, 3])  # 3 erasures = bound
+
+    assert group.erasure_recovery_bound == 3
+    for pid in (0, 2, 3):
+        assert np.array_equal(recovered[pid].K, pages[pid].K)
+        assert np.array_equal(recovered[pid].V, pages[pid].V)
+
+
+def test_cauchy_rs_fails_loud_beyond_erasure_bound() -> None:
+    pages = [float_page(i) for i in range(4)]
+    group = encode_rs_erasure_group(pages, num_parity=2)
+
+    with pytest.raises(UncorrectableError):
+        recover_rs_erasure(group, missing_page_ids=[0, 1, 2])  # 3 > 2 parity
