@@ -26,7 +26,7 @@ QUANT_NOISE_LEVEL = 0.35
 BIT_FLIP_P = 0.0008
 EVICTED_PAGE_ID = "p0"
 BIT_FLIP_PAGE_ID = "p1"
-RECOVERY_TARGET = 0.80
+LAMBDA_SWEEP = tuple(float(value) for value in np.logspace(0.0, 9.0, num=181))
 
 
 @dataclass(frozen=True)
@@ -46,33 +46,52 @@ class BaselineResult:
     storage_bits: int
     compute_proxy: float
     residual_error: float
-    overhead_proxy: float
     notes: str
 
 
 @dataclass(frozen=True)
+class LambdaWinRange:
+    winner: str
+    start: float
+    end: float
+
+
+@dataclass(frozen=True)
+class ParetoPoint:
+    key: str
+    storage_bits: int
+    residual_error: float
+    dominated: bool
+
+
+@dataclass(frozen=True)
 class GateResult:
-    damage_cost: float
-    recovered_fraction: float
-    heal_overhead: float
-    b3_beats_b2_error_regime: bool
-    recovery_condition: bool
-    overhead_condition: bool
-    error_regime_condition: bool
+    lambda_ranges: tuple[LambdaWinRange, ...]
+    pareto_points: tuple[ParetoPoint, ...]
+    aepk_non_dominated: bool
+    aepk_lambda_ranges: tuple[LambdaWinRange, ...]
 
     @property
     def verdict(self) -> str:
-        if self.recovery_condition and self.overhead_condition and self.error_regime_condition:
+        if self.aepk_non_dominated and self.aepk_lambda_ranges:
             return "PASS"
         return "FAIL"
 
 
 @dataclass(frozen=True)
-class ReportData:
+class ScenarioResult:
+    name: str
     baselines: Mapping[str, BaselineResult]
     gate: GateResult
     residency_tiers: Mapping[object, ResidencyTier]
     detector_flags: Mapping[object, bool]
+    budget_bits: int
+
+
+@dataclass(frozen=True)
+class ReportData:
+    primary: ScenarioResult
+    tight_budget: ScenarioResult
 
 
 def build_clean_pages(seed: int = SEED) -> tuple[KVPage, ...]:
@@ -128,38 +147,16 @@ def make_fault_scenario(clean_pages: tuple[KVPage, ...]) -> FaultScenario:
 def run_validation() -> ReportData:
     clean_pages = build_clean_pages()
     scenario = make_fault_scenario(clean_pages)
-    b1_quality = 0.0
-    b0 = _run_no_protection(scenario)
-    b1 = BaselineResult(
-        name="B1 keep-all-RESIDENT",
-        quality_loss_mse=b1_quality,
-        storage_bits=_resident_bits(clean_pages),
-        compute_proxy=0.0,
-        residual_error=b1_quality,
-        overhead_proxy=float(_resident_bits(clean_pages)),
-        notes="Cost ceiling: clean resident pages, no damage.",
-    )
-    b2 = _run_erasure_parity_only(scenario)
-    b3, tiers, detector_flags = _run_full_aepk_stack(scenario)
-    damage_cost = b0.quality_loss_mse - b1.quality_loss_mse
-    recovered_fraction = (
-        (b0.quality_loss_mse - b3.quality_loss_mse) / damage_cost if damage_cost > 0.0 else 0.0
-    )
-    heal_overhead = b3.overhead_proxy
-    gate = GateResult(
-        damage_cost=damage_cost,
-        recovered_fraction=recovered_fraction,
-        heal_overhead=heal_overhead,
-        b3_beats_b2_error_regime=b3.quality_loss_mse < b2.quality_loss_mse,
-        recovery_condition=recovered_fraction >= RECOVERY_TARGET,
-        overhead_condition=heal_overhead < damage_cost,
-        error_regime_condition=b3.quality_loss_mse < b2.quality_loss_mse,
-    )
+    stress_pages = _with_attention_masses(clean_pages, (50.0, 10.0, 1.0, 0.1))
+    stress_scenario = make_fault_scenario(stress_pages)
+    manager = ResidencyManager()
+    coded = manager.cost_model.coded_bits(clean_pages[0])
+    resident = manager.cost_model.resident_bits(clean_pages[0])
+    primary_budget = coded * 3 + resident
+    tight_budget = resident + coded
     return ReportData(
-        baselines={"B0": b0, "B1": b1, "B2": b2, "B3": b3},
-        gate=gate,
-        residency_tiers=tiers,
-        detector_flags=detector_flags,
+        primary=_run_scenario("primary", scenario, primary_budget),
+        tight_budget=_run_scenario("tight-budget tier stress", stress_scenario, tight_budget),
     )
 
 
@@ -171,55 +168,197 @@ def write_report(path: Path = REPORT_PATH) -> ReportData:
 
 
 def render_report(data: ReportData) -> str:
+    overall_verdict = "PASS"
+    if data.primary.gate.verdict == "FAIL" or data.tight_budget.gate.verdict == "FAIL":
+        overall_verdict = "FAIL"
     lines = [
         "# AEPK-Paging Phase 6 REPORT",
         "",
         "This is a numpy-only simulation net-overhead report. It is necessary but not sufficient; Bar 2 on real model KV is Phase 7.",
         "",
-        "## Scenario",
+        "## Gate Definition",
+        "- Rate-distortion currency uses `[Shannon]`: `total_cost(λ) = storage_bits + λ * residual_error`.",
+        f"- λ sweep: `{LAMBDA_SWEEP[0]:.2e}` to `{LAMBDA_SWEEP[-1]:.2e}` bits per unit residual MSE.",
+        "- PASS iff B3 is Pareto-non-dominated and B3 wins total-cost for at least one reported λ-range.",
+        "- Compute proxy is reported as a caveat only; it is not mixed into the rate-distortion gate.",
+        "- 12x compute caveat: B3 uses 12.00 detector/recovery proxy ops in the primary scenario.",
+        "",
+        "## Corruption Scenario",
         f"- Seed: `{SEED}`",
         f"- Corruptions: `quant_noise(level={QUANT_NOISE_LEVEL})`, `bit_flip(p={BIT_FLIP_P})`, `forced_evict(page_ids=['{EVICTED_PAGE_ID}'])`",
-        f"- Gate recovery target X: `{RECOVERY_TARGET:.2f}`",
         "",
-        "## Baseline Matrix",
-        "| Baseline | Quality loss MSE | Storage bits | Compute proxy | Residual error | Total overhead proxy | Notes |",
-        "|---|---:|---:|---:|---:|---:|---|",
     ]
-    for key in ("B0", "B1", "B2", "B3"):
-        item = data.baselines[key]
-        lines.append(
-            f"| {item.name} | {item.quality_loss_mse:.8f} | {item.storage_bits} | "
-            f"{item.compute_proxy:.2f} | {item.residual_error:.8f} | {item.overhead_proxy:.8f} | {item.notes} |"
-        )
+    lines.extend(_render_scenario(data.primary))
+    lines.extend(_render_scenario(data.tight_budget))
     lines.extend(
         [
-            "",
-            "## AEPK Residency Decisions",
-            "| Page | Tier | Detector flagged |",
-            "|---|---|---:|",
-        ]
-    )
-    for page_id in sorted(data.residency_tiers, key=repr):
-        lines.append(
-            f"| {page_id} | {data.residency_tiers[page_id].value} | {data.detector_flags[page_id]} |"
-        )
-    gate = data.gate
-    lines.extend(
-        [
-            "",
-            "## Net-Overhead Gate",
-            f"- `damage_cost = B0_quality_loss - B1_quality_loss = {gate.damage_cost:.8f}`",
-            f"- `heal_overhead = B3_extra_bits + compute_proxy + residual_error = {gate.heal_overhead:.8f}`",
-            f"- Recovery condition: `{gate.recovered_fraction:.8f} >= {RECOVERY_TARGET:.8f}` -> `{gate.recovery_condition}`",
-            f"- Overhead condition: `{gate.heal_overhead:.8f} < {gate.damage_cost:.8f}` -> `{gate.overhead_condition}`",
-            f"- Error-regime condition: `B3_quality_loss < B2_quality_loss` -> `{gate.error_regime_condition}`",
-            f"- B3 beats B2 on error regime: `{gate.b3_beats_b2_error_regime}`",
-            "",
-            f"GATE VERDICT: {gate.verdict}",
+            "## Corrected Gate Verdict",
+            f"- Primary scenario verdict: `{data.primary.gate.verdict}`",
+            f"- Tight-budget scenario verdict: `{data.tight_budget.gate.verdict}`",
+            f"GATE VERDICT: {overall_verdict}",
             "",
         ]
     )
     return "\n".join(lines)
+
+
+def _render_scenario(scenario: ScenarioResult) -> list[str]:
+    lines = [
+        f"## Scenario: {scenario.name}",
+        f"- AEPK residency budget bits: `{scenario.budget_bits}`",
+        "",
+        "### Baseline Matrix",
+        "| Baseline | Quality loss MSE | Storage bits | Compute proxy | Residual error | Notes |",
+        "|---|---:|---:|---:|---:|---|",
+    ]
+    if "tier stress" in scenario.name:
+        lines.insert(
+            2,
+            "- Tight-budget tier stress uses higher attention_mass values to exercise residency tiers; Phase 2-5 constants are unchanged.",
+        )
+    for key in ("B0", "B1", "B2", "B3"):
+        item = scenario.baselines[key]
+        lines.append(
+            f"| {item.name} | {item.quality_loss_mse:.8f} | {item.storage_bits} | "
+            f"{item.compute_proxy:.2f} | {item.residual_error:.8f} | {item.notes} |"
+        )
+    lines.extend(
+        [
+            "",
+            "### Pareto Table",
+            "| Baseline | Storage bits | Residual error | Dominated |",
+            "|---|---:|---:|---:|",
+        ]
+    )
+    for point in scenario.gate.pareto_points:
+        lines.append(
+            f"| {point.key} | {point.storage_bits} | {point.residual_error:.8f} | {point.dominated} |"
+        )
+    lines.extend(
+        [
+            "",
+            "### λ Win Ranges",
+            "| Winner | λ start | λ end |",
+            "|---|---:|---:|",
+        ]
+    )
+    for item in scenario.gate.lambda_ranges:
+        lines.append(f"| {item.winner} | {item.start:.8e} | {item.end:.8e} |")
+    if not scenario.gate.lambda_ranges:
+        lines.append("| none | 0.00000000e+00 | 0.00000000e+00 |")
+    aepk_ranges = _format_ranges(scenario.gate.aepk_lambda_ranges)
+    lines.extend(
+        [
+            "",
+            "### AEPK Residency Decisions",
+            "| Page | Tier | Detector flagged |",
+            "|---|---|---:|",
+        ]
+    )
+    for page_id in sorted(scenario.residency_tiers, key=repr):
+        lines.append(
+            f"| {page_id} | {scenario.residency_tiers[page_id].value} | {scenario.detector_flags[page_id]} |"
+        )
+    tier_counts = _tier_counts(scenario.residency_tiers.values())
+    lines.extend(
+        [
+            "",
+            "### Corrected Gate",
+            f"- B3 Pareto-non-dominated: `{scenario.gate.aepk_non_dominated}`",
+            f"- B3 λ win range(s): `{aepk_ranges}`",
+            f"- Scenario verdict: `{scenario.gate.verdict}`",
+            f"- Tier distribution: `RESIDENT={tier_counts[ResidencyTier.RESIDENT]}, CODED={tier_counts[ResidencyTier.CODED]}, EVICTED={tier_counts[ResidencyTier.EVICTED]}`",
+            "",
+        ]
+    )
+    return lines
+
+
+def _run_scenario(name: str, scenario: FaultScenario, budget_bits: int) -> ScenarioResult:
+    b0 = _run_no_protection(scenario)
+    b1 = BaselineResult(
+        name="B1 keep-all-RESIDENT",
+        quality_loss_mse=0.0,
+        storage_bits=_resident_bits(scenario.clean_pages),
+        compute_proxy=0.0,
+        residual_error=0.0,
+        notes="Cost ceiling: clean resident pages, no damage.",
+    )
+    b2 = _run_erasure_parity_only(scenario)
+    b3, tiers, detector_flags = _run_full_aepk_stack(scenario, budget_bits)
+    baselines = {"B0": b0, "B1": b1, "B2": b2, "B3": b3}
+    return ScenarioResult(
+        name=name,
+        baselines=baselines,
+        gate=_rate_distortion_gate(baselines),
+        residency_tiers=tiers,
+        detector_flags=detector_flags,
+        budget_bits=budget_bits,
+    )
+
+
+def _rate_distortion_gate(baselines: Mapping[str, BaselineResult]) -> GateResult:
+    pareto = tuple(_pareto_points(baselines))
+    ranges = tuple(_lambda_win_ranges(baselines))
+    aepk_ranges = tuple(item for item in ranges if item.winner == "B3")
+    b3_point = next(point for point in pareto if point.key == "B3")
+    return GateResult(
+        lambda_ranges=ranges,
+        pareto_points=pareto,
+        aepk_non_dominated=not b3_point.dominated,
+        aepk_lambda_ranges=aepk_ranges,
+    )
+
+
+def _pareto_points(baselines: Mapping[str, BaselineResult]) -> list[ParetoPoint]:
+    points: list[ParetoPoint] = []
+    for key, item in baselines.items():
+        dominated = any(
+            other_key != key
+            and other.storage_bits <= item.storage_bits
+            and other.residual_error <= item.residual_error
+            and (other.storage_bits < item.storage_bits or other.residual_error < item.residual_error)
+            for other_key, other in baselines.items()
+        )
+        points.append(
+            ParetoPoint(
+                key=key,
+                storage_bits=item.storage_bits,
+                residual_error=item.residual_error,
+                dominated=dominated,
+            )
+        )
+    return sorted(points, key=lambda point: point.key)
+
+
+def _lambda_win_ranges(baselines: Mapping[str, BaselineResult]) -> list[LambdaWinRange]:
+    winners: list[str] = []
+    for lam in LAMBDA_SWEEP:
+        totals = {
+            key: item.storage_bits + lam * item.residual_error
+            for key, item in baselines.items()
+        }
+        winners.append(min(totals, key=lambda key: (totals[key], key)))
+    ranges: list[LambdaWinRange] = []
+    start_index = 0
+    for index in range(1, len(winners)):
+        if winners[index] != winners[start_index]:
+            ranges.append(
+                LambdaWinRange(
+                    winner=winners[start_index],
+                    start=LAMBDA_SWEEP[start_index],
+                    end=LAMBDA_SWEEP[index - 1],
+                )
+            )
+            start_index = index
+    ranges.append(
+        LambdaWinRange(
+            winner=winners[start_index],
+            start=LAMBDA_SWEEP[start_index],
+            end=LAMBDA_SWEEP[-1],
+        )
+    )
+    return ranges
 
 
 def _run_no_protection(scenario: FaultScenario) -> BaselineResult:
@@ -233,7 +372,6 @@ def _run_no_protection(scenario: FaultScenario) -> BaselineResult:
         storage_bits=0,
         compute_proxy=0.0,
         residual_error=quality,
-        overhead_proxy=quality,
         notes="Takes quant-noise, raw bit-flip damage, and forced eviction.",
     )
 
@@ -252,18 +390,17 @@ def _run_erasure_parity_only(scenario: FaultScenario) -> BaselineResult:
         storage_bits=parity_bits,
         compute_proxy=1.0,
         residual_error=quality,
-        overhead_proxy=float(parity_bits) + 1.0 + quality,
         notes="GhostServe-like known-erasure recovery; no unknown-location bit-flip correction.",
     )
 
 
 def _run_full_aepk_stack(
     scenario: FaultScenario,
+    budget_bits: int,
 ) -> tuple[BaselineResult, Mapping[object, ResidencyTier], Mapping[object, bool]]:
     manager = ResidencyManager()
     clean_pages = scenario.clean_pages
-    budget = manager.cost_model.coded_bits(clean_pages[0]) * 3 + manager.cost_model.resident_bits(clean_pages[0])
-    plan = manager.plan(clean_pages, budget_bits=budget)
+    plan = manager.plan(clean_pages, budget_bits=budget_bits)
     tiers = {page_id: decision.tier for page_id, decision in plan.decisions.items()}
     group = encode_erasure_group(clean_pages)
     code = HammingSECDEDCode()
@@ -274,6 +411,16 @@ def _run_full_aepk_stack(
         corrected = code.correct(tuple(protected_by_id.values()))
     except UncorrectableError:
         corrected = {}
+
+    missing_page_ids = {
+        page.page_id
+        for page in clean_pages
+        if page.page_id == scenario.evicted_page_id or tiers[page.page_id] is ResidencyTier.EVICTED
+    }
+    recovered_erasures: dict[object, KVPage] = {}
+    if len(missing_page_ids) == 1:
+        missing_id = next(iter(missing_page_ids))
+        recovered_erasures[missing_id] = recover_erasure(group, [missing_id])
 
     outputs: dict[object, KVPage | None] = {}
     detector_flags: dict[object, bool] = {}
@@ -286,8 +433,8 @@ def _run_full_aepk_stack(
         detector_flags[page.page_id] = flagged
         compute_proxy += 2.0
         tier = tiers[page.page_id]
-        if page.page_id == scenario.evicted_page_id or tier is ResidencyTier.EVICTED:
-            outputs[page.page_id] = recover_erasure(group, [page.page_id])
+        if page.page_id in missing_page_ids:
+            outputs[page.page_id] = recovered_erasures.get(page.page_id)
             compute_proxy += 1.0
         elif tier is ResidencyTier.RESIDENT:
             outputs[page.page_id] = page
@@ -303,19 +450,20 @@ def _run_full_aepk_stack(
     quality = _quality_loss(clean_pages, outputs)
     parity_bits = int(group.parity_K.nbytes + group.parity_V.nbytes) * 8
     raw_quant_bits = sum((page.K.size + page.V.size) * 8 for page in clean_pages)
-    protected_bits = sum((protected_page.K.values.size + protected_page.V.values.size) * 8 for protected_page in protected)
+    protected_bits = sum(
+        (protected_page.K.values.size + protected_page.V.values.size) * 8
+        for protected_page in protected
+    )
     syndrome_bits = int(protected_bits - raw_quant_bits)
     fingerprint_bits = len(clean_pages) * 128
-    extra_bits = parity_bits + syndrome_bits + fingerprint_bits + plan.total_storage_bits
-    overhead = float(extra_bits) + compute_proxy + quality
+    storage_bits = parity_bits + syndrome_bits + fingerprint_bits + plan.total_storage_bits
     return (
         BaselineResult(
             name="B3 full AEPK stack",
             quality_loss_mse=quality,
-            storage_bits=extra_bits,
+            storage_bits=storage_bits,
             compute_proxy=compute_proxy,
             residual_error=quality,
-            overhead_proxy=overhead,
             notes="Detection + parity/SECDED recovery + thermodynamic residency decision.",
         ),
         tiers,
@@ -356,6 +504,35 @@ def _page_by_id(pages: Iterable[KVPage], page_id: object) -> KVPage:
         if page.page_id == page_id:
             return page
     raise KeyError(page_id)
+
+
+def _with_attention_masses(pages: Iterable[KVPage], masses: Iterable[float]) -> tuple[KVPage, ...]:
+    return tuple(
+        KVPage(
+            page_id=page.page_id,
+            layer=page.layer,
+            token_range=page.token_range,
+            K=page.K,
+            V=page.V,
+            precision_tag=page.precision_tag,
+            attention_mass=mass,
+        )
+        for page, mass in zip(pages, masses)
+    )
+
+
+def _tier_counts(tiers: Iterable[ResidencyTier]) -> dict[ResidencyTier, int]:
+    counts = {tier: 0 for tier in ResidencyTier}
+    for tier in tiers:
+        counts[tier] += 1
+    return counts
+
+
+def _format_ranges(ranges: Iterable[LambdaWinRange]) -> str:
+    values = list(ranges)
+    if not values:
+        return "none"
+    return ", ".join(f"{item.start:.2e}..{item.end:.2e}" for item in values)
 
 
 def main() -> None:

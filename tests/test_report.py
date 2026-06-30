@@ -10,5 +10,7 @@ def test_report_is_generated_with_literal_gate_verdict() -> None:
 
     assert report_path.exists()
     assert "## Baseline Matrix" in text
-    assert "## Net-Overhead Gate" in text
+    assert "## Gate Definition" in text
+    assert "### Pareto Table" in text
+    assert "### λ Win Ranges" in text
     assert ("GATE VERDICT: PASS" in text) or ("GATE VERDICT: FAIL" in text)
