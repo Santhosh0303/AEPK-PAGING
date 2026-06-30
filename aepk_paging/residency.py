@@ -6,6 +6,9 @@ from dataclasses import dataclass
 from math import log
 from typing import Iterable, Mapping
 
+import numpy as np
+
+from aepk_paging.detect import attention_distribution
 from aepk_paging.kv_page import KVPage, ResidencyTier
 
 
@@ -16,6 +19,8 @@ LANDAUER_KT_LN2 = log(2.0)
 class TierEstimate:
     tier: ResidencyTier
     storage_bits: int
+    energy: float
+    entropy_nats: float
     free_energy: float
 
 
@@ -41,8 +46,8 @@ class ResidencyPlan:
 class TierCostModel:
     """Free-energy residency law.
 
-    [Gibbs] role: attention mass is used as a Boltzmann/Gibbs-style utility
-    weight, so high-mass pages get larger benefit from sharper residency.
+    [Gibbs] role: softmax attention is treated as a Boltzmann distribution and
+    contributes Shannon entropy S to F = E - kT*S; sharper tiers retain more S.
     [Landauer] role: each EVICTED page accounts an irreversible erase floor of
     erased_bits * kT * ln2 through the configured `temperature_kt`.
     """
@@ -53,6 +58,7 @@ class TierCostModel:
     coded_utility_weight: float = 900.0
     coded_distortion_weight: float = 160.0
     eviction_distortion_weight: float = 1400.0
+    coded_entropy_retention: float = 0.5
 
     @property
     def landauer_per_bit(self) -> float:
@@ -72,27 +78,38 @@ class TierCostModel:
         resident_bits = self.resident_bits(page)
         coded_bits = self.coded_bits(page)
         landauer = self.erased_bits(page) * self.landauer_per_bit
+        entropy = page_attention_entropy(page)
+        resident_energy = float(resident_bits - self.resident_utility_weight * mass)
+        coded_energy = float(
+            coded_bits - self.coded_utility_weight * mass + self.coded_distortion_weight * mass
+        )
+        evicted_energy = float(landauer + self.eviction_distortion_weight * mass)
         return {
             ResidencyTier.RESIDENT: TierEstimate(
                 tier=ResidencyTier.RESIDENT,
                 storage_bits=resident_bits,
-                free_energy=float(resident_bits - self.resident_utility_weight * mass),
+                energy=resident_energy,
+                entropy_nats=entropy,
+                free_energy=self.free_energy(resident_energy, entropy),
             ),
             ResidencyTier.CODED: TierEstimate(
                 tier=ResidencyTier.CODED,
                 storage_bits=coded_bits,
-                free_energy=float(
-                    coded_bits
-                    - self.coded_utility_weight * mass
-                    + self.coded_distortion_weight * mass
-                ),
+                energy=coded_energy,
+                entropy_nats=entropy * self.coded_entropy_retention,
+                free_energy=self.free_energy(coded_energy, entropy * self.coded_entropy_retention),
             ),
             ResidencyTier.EVICTED: TierEstimate(
                 tier=ResidencyTier.EVICTED,
                 storage_bits=0,
-                free_energy=float(landauer + self.eviction_distortion_weight * mass),
+                energy=evicted_energy,
+                entropy_nats=0.0,
+                free_energy=self.free_energy(evicted_energy, 0.0),
             ),
         }
+
+    def free_energy(self, energy: float, entropy_nats: float) -> float:
+        return float(energy - self.temperature_kt * entropy_nats)
 
     def choose_tier(self, page: KVPage, budget_bits: int) -> TierEstimate:
         feasible = [
@@ -190,3 +207,9 @@ class ResidencyManager:
         estimates: Mapping[object, Mapping[ResidencyTier, TierEstimate]],
     ) -> float:
         return float(sum(estimates[page_id][tier].free_energy for page_id, tier in current.items()))
+
+
+def page_attention_entropy(page: KVPage, *, temperature: float = 1.0) -> float:
+    weights = attention_distribution(page, temperature=temperature).astype(np.float64)
+    positive = weights[weights > 0.0]
+    return float(-np.sum(positive * np.log(positive)))

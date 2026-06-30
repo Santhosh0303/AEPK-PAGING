@@ -18,16 +18,20 @@ class DetectorResult:
 
 def attention_mass(page: KVPage, *, temperature: float = 1.0, top_fraction: float = 0.5) -> float:
     """Return the Gibbs-fingerprint mass over the leading page tokens."""
-    if temperature <= 0.0:
-        raise ValueError("temperature must be positive")
     if not 0.0 < top_fraction <= 1.0:
         raise ValueError("top_fraction must be in (0, 1]")
+    weights = attention_distribution(page, temperature=temperature)
+    keep = max(1, int(np.ceil(weights.shape[0] * top_fraction)))
+    return float(np.sum(weights[:keep]))
+
+
+def attention_distribution(page: KVPage, *, temperature: float = 1.0) -> np.ndarray:
+    if temperature <= 0.0:
+        raise ValueError("temperature must be positive")
     scores = np.linalg.norm(page.K.astype(np.float32), axis=1) / np.float32(temperature)
     shifted = scores - np.max(scores)
     weights = np.exp(shifted)
-    weights = weights / np.sum(weights)
-    keep = max(1, int(np.ceil(weights.shape[0] * top_fraction)))
-    return float(np.sum(weights[:keep]))
+    return weights / np.sum(weights)
 
 
 def attention_mass_detector(

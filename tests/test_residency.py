@@ -1,7 +1,12 @@
 import numpy as np
 
 from aepk_paging.kv_page import KVPage, ResidencyTier
-from aepk_paging.residency import LANDAUER_KT_LN2, ResidencyManager, TierCostModel
+from aepk_paging.residency import (
+    LANDAUER_KT_LN2,
+    ResidencyManager,
+    TierCostModel,
+    page_attention_entropy,
+)
 
 
 def page(page_id: str, mass: float) -> KVPage:
@@ -87,3 +92,51 @@ def test_landauer_cost_counts_evicted_pages_and_settling_energy_never_increases(
         later <= earlier
         for earlier, later in zip(plan.settling_free_energy, plan.settling_free_energy[1:])
     )
+
+
+def test_attention_entropy_rises_when_distribution_flattens() -> None:
+    peaked = KVPage(
+        page_id="peaked",
+        layer=0,
+        token_range=(0, 4),
+        K=np.array(
+            [
+                [8.0, 0.0, 0.0, 0.0],
+                [0.1, 0.0, 0.0, 0.0],
+                [0.1, 0.0, 0.0, 0.0],
+                [0.1, 0.0, 0.0, 0.0],
+            ],
+            dtype=np.float32,
+        ),
+        V=np.ones((4, 4), dtype=np.float32),
+        precision_tag="float32",
+        attention_mass=0.9,
+    )
+    flattened = KVPage(
+        page_id="flat",
+        layer=0,
+        token_range=(4, 8),
+        K=np.zeros((4, 4), dtype=np.float32),
+        V=np.ones((4, 4), dtype=np.float32),
+        precision_tag="float32",
+        attention_mass=0.9,
+    )
+
+    assert page_attention_entropy(flattened) > page_attention_entropy(peaked)
+
+
+def test_tier_ordering_is_monotonic_across_utility_weight_sweep() -> None:
+    pages = phase5_pages()
+    for scale in (0.5, 1.0, 1.5):
+        model = TierCostModel(
+            resident_utility_weight=2400.0 * scale,
+            coded_utility_weight=900.0 * scale,
+            coded_distortion_weight=160.0 * scale,
+            eviction_distortion_weight=1400.0 * scale,
+        )
+        manager = ResidencyManager(cost_model=model)
+        budget = model.coded_bits(pages[0]) * 4 + (model.resident_bits(pages[0]) - model.coded_bits(pages[0]))
+        plan = manager.plan(pages, budget_bits=budget)
+        ranked_tiers = [tier_rank(plan.decisions[item.page_id].tier) for item in pages]
+
+        assert ranked_tiers == sorted(ranked_tiers)
