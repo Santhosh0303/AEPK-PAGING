@@ -17,6 +17,7 @@ class DetectorResult:
 
 
 def attention_mass(page: KVPage, *, temperature: float = 1.0, top_fraction: float = 0.5) -> float:
+    """Return the Gibbs-fingerprint mass over the leading page tokens."""
     if temperature <= 0.0:
         raise ValueError("temperature must be positive")
     if not 0.0 < top_fraction <= 1.0:
@@ -37,6 +38,7 @@ def attention_mass_detector(
     temperature: float = 1.0,
     top_fraction: float = 0.5,
 ) -> DetectorResult:
+    """Gibbs-fingerprint drift detector vs stored clean baseline."""
     baseline = page.attention_mass if expected_mass is None else expected_mass
     current = attention_mass(page, temperature=temperature, top_fraction=top_fraction)
     deviation = abs(current - baseline)
@@ -71,3 +73,29 @@ def confidence_proxy(logits: np.ndarray, *, surprise_threshold: float = 0.25) ->
         deviation=surprise,
         tolerance=surprise_threshold,
     )
+
+
+def fixed_kv_readout_logits(
+    page: KVPage,
+    *,
+    seed: int,
+    num_logits: int = 3,
+    head_scale: float = 3.0,
+) -> np.ndarray:
+    if num_logits < 2:
+        raise ValueError("num_logits must be at least 2")
+    K = page.K.astype(np.float32)
+    V = page.V.astype(np.float32)
+    d = K.shape[1]
+    rng = np.random.default_rng(seed)
+    q = rng.normal(loc=0.0, scale=1.0, size=d).astype(np.float32)
+    head = (
+        rng.normal(loc=0.0, scale=1.0, size=(d, num_logits)).astype(np.float32)
+        * np.float32(head_scale)
+    )
+    scores = (K @ q) / np.float32(d**0.5)
+    shifted = scores - np.max(scores)
+    weights = np.exp(shifted)
+    weights = weights / np.sum(weights)
+    output = weights @ V
+    return output @ head

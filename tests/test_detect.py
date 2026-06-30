@@ -5,6 +5,7 @@ from aepk_paging.detect import (
     attention_mass,
     attention_mass_detector,
     confidence_proxy,
+    fixed_kv_readout_logits,
     norm_consistency_detector,
     norm_ratio,
 )
@@ -72,15 +73,25 @@ def test_confident_wrong_confidence_blind_but_invariant_catches() -> None:
     page = clean_page()
     corrupted, _ = quant_noise(page, level=0.8, seed=17)
 
-    low_surprise_logits = np.array([12.0, -2.0, -4.0], dtype=np.float32)
-    confidence = confidence_proxy(low_surprise_logits, surprise_threshold=0.25)
-    invariant = attention_mass_detector(
+    clean_logits = fixed_kv_readout_logits(page, seed=1)
+    corrupted_logits = fixed_kv_readout_logits(corrupted, seed=1)
+    clean_confidence = confidence_proxy(clean_logits, surprise_threshold=0.25)
+    corrupted_confidence = confidence_proxy(corrupted_logits, surprise_threshold=0.25)
+    mass_invariant = attention_mass_detector(
         corrupted,
         expected_mass=page.attention_mass,
         tolerance=0.01,
     )
+    norm_invariant = norm_consistency_detector(
+        corrupted,
+        expected_ratio=norm_ratio(page),
+        tolerance=0.01,
+    )
 
-    assert not confidence.flag
-    assert confidence.deviation < confidence.tolerance
-    assert invariant.flag
-    assert invariant.deviation > invariant.tolerance
+    assert not clean_confidence.flag
+    assert not corrupted_confidence.flag
+    assert abs(corrupted_confidence.deviation - clean_confidence.deviation) < 0.1
+    assert mass_invariant.flag
+    assert mass_invariant.deviation > mass_invariant.tolerance
+    assert norm_invariant.flag
+    assert norm_invariant.deviation > norm_invariant.tolerance
