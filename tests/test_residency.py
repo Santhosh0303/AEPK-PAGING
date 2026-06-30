@@ -1,4 +1,6 @@
 import numpy as np
+from hypothesis import given
+from hypothesis import strategies as st
 
 from aepk_paging.kv_page import KVPage, ResidencyTier
 from aepk_paging.residency import (
@@ -86,7 +88,7 @@ def test_landauer_cost_counts_evicted_pages_and_settling_energy_never_increases(
         if plan.decisions[item.page_id].tier is ResidencyTier.EVICTED
     )
 
-    assert plan.eviction_count == 2
+    assert plan.eviction_count == 1
     assert plan.landauer_cost == evicted_bits * LANDAUER_KT_LN2
     assert all(
         later <= earlier
@@ -140,3 +142,77 @@ def test_tier_ordering_is_monotonic_across_utility_weight_sweep() -> None:
         ranked_tiers = [tier_rank(plan.decisions[item.page_id].tier) for item in pages]
 
         assert ranked_tiers == sorted(ranked_tiers)
+
+
+@given(
+    masses=st.lists(
+        st.floats(min_value=0.0, max_value=50.0, allow_nan=False, allow_infinity=False),
+        min_size=2,
+        max_size=8,
+    ),
+    budget_bits=st.integers(min_value=0, max_value=32768),
+    parity_group_size=st.integers(min_value=1, max_value=4),
+)
+def test_residency_plan_respects_erasure_capacity_per_parity_group(
+    masses: list[float],
+    budget_bits: int,
+    parity_group_size: int,
+) -> None:
+    pages = [page(f"p{index}", mass) for index, mass in enumerate(masses)]
+    manager = ResidencyManager()
+
+    plan = manager.plan(
+        pages,
+        budget_bits=budget_bits,
+        erasure_recovery_bound=1,
+        parity_group_size=parity_group_size,
+    )
+
+    ordered_pages = sorted(pages, key=lambda item: (item.token_range, repr(item.page_id)))
+    for start in range(0, len(ordered_pages), parity_group_size):
+        group = ordered_pages[start : start + parity_group_size]
+        evicted = sum(
+            1 for item in group if plan.decisions[item.page_id].tier is ResidencyTier.EVICTED
+        )
+        assert evicted <= 1
+
+
+def test_flagged_pages_are_kept_coded_before_unflagged_when_capacity_is_tight() -> None:
+    pages = [page("p0", 0.1), page("p1", 0.2), page("p2", 0.3)]
+    manager = ResidencyManager()
+
+    plan = manager.plan(
+        pages,
+        budget_bits=0,
+        erasure_recovery_bound=1,
+        flagged_page_ids={"p0", "p1"},
+    )
+
+    assert plan.decisions["p2"].tier is ResidencyTier.EVICTED
+    assert plan.decisions["p0"].tier is ResidencyTier.CODED
+    assert plan.decisions["p1"].tier is ResidencyTier.CODED
+
+
+def test_known_erasure_consumes_reconstruction_capacity() -> None:
+    pages = [page("p0", 50.0), page("p1", 10.0), page("p2", 1.0), page("p3", 0.1)]
+    manager = ResidencyManager()
+
+    plan = manager.plan(
+        pages,
+        budget_bits=0,
+        erasure_recovery_bound=1,
+        known_erasure_ids={"p0"},
+    )
+
+    assert plan.decisions["p0"].tier is ResidencyTier.EVICTED
+    assert sum(
+        1 for item in pages if plan.decisions[item.page_id].tier is ResidencyTier.EVICTED
+    ) == 1
+
+    high_budget = manager.plan(
+        pages,
+        budget_bits=manager.cost_model.resident_bits(pages[0]) * len(pages),
+        erasure_recovery_bound=1,
+        known_erasure_ids={"p0"},
+    )
+    assert high_budget.decisions["p0"].tier is ResidencyTier.EVICTED

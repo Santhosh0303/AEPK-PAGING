@@ -153,7 +153,7 @@ def run_validation() -> ReportData:
     coded = manager.cost_model.coded_bits(clean_pages[0])
     resident = manager.cost_model.resident_bits(clean_pages[0])
     primary_budget = coded * 3 + resident
-    tight_budget = resident + coded
+    tight_budget = resident + coded * 2
     return ReportData(
         primary=_run_scenario("primary", scenario, primary_budget),
         tight_budget=_run_scenario("tight-budget tier stress", stress_scenario, tight_budget),
@@ -400,7 +400,14 @@ def _run_full_aepk_stack(
 ) -> tuple[BaselineResult, Mapping[object, ResidencyTier], Mapping[object, bool]]:
     manager = ResidencyManager()
     clean_pages = scenario.clean_pages
-    plan = manager.plan(clean_pages, budget_bits=budget_bits)
+    detector_flags = _detector_flags(scenario)
+    plan = manager.plan(
+        clean_pages,
+        budget_bits=budget_bits,
+        erasure_recovery_bound=1,
+        flagged_page_ids=[page_id for page_id, flagged in detector_flags.items() if flagged],
+        known_erasure_ids=[scenario.evicted_page_id],
+    )
     tiers = {page_id: decision.tier for page_id, decision in plan.decisions.items()}
     group = encode_erasure_group(clean_pages)
     code = HammingSECDEDCode()
@@ -423,14 +430,8 @@ def _run_full_aepk_stack(
         recovered_erasures[missing_id] = recover_erasure(group, [missing_id])
 
     outputs: dict[object, KVPage | None] = {}
-    detector_flags: dict[object, bool] = {}
     compute_proxy = 0.0
     for page in clean_pages:
-        noisy = scenario.quant_noisy_pages[page.page_id]
-        mass = attention_mass_detector(noisy, expected_mass=page.attention_mass, tolerance=0.01)
-        norm = norm_consistency_detector(noisy, expected_ratio=norm_ratio(page), tolerance=0.01)
-        flagged = mass.flag or norm.flag
-        detector_flags[page.page_id] = flagged
         compute_proxy += 2.0
         tier = tiers[page.page_id]
         if page.page_id in missing_page_ids:
@@ -445,7 +446,7 @@ def _run_full_aepk_stack(
             outputs[page.page_id] = quantize_page(page, bit_width=8).dequantize()
             compute_proxy += 1.0
         else:
-            outputs[page.page_id] = noisy
+            outputs[page.page_id] = scenario.quant_noisy_pages[page.page_id]
 
     quality = _quality_loss(clean_pages, outputs)
     parity_bits = int(group.parity_K.nbytes + group.parity_V.nbytes) * 8
@@ -469,6 +470,16 @@ def _run_full_aepk_stack(
         tiers,
         detector_flags,
     )
+
+
+def _detector_flags(scenario: FaultScenario) -> dict[object, bool]:
+    flags: dict[object, bool] = {}
+    for page in scenario.clean_pages:
+        noisy = scenario.quant_noisy_pages[page.page_id]
+        mass = attention_mass_detector(noisy, expected_mass=page.attention_mass, tolerance=0.01)
+        norm = norm_consistency_detector(noisy, expected_ratio=norm_ratio(page), tolerance=0.01)
+        flags[page.page_id] = mass.flag or norm.flag
+    return flags
 
 
 def _quality_loss(clean_pages: Iterable[KVPage], outputs: Mapping[object, KVPage | None]) -> float:
