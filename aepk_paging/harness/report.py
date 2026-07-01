@@ -9,10 +9,13 @@ from typing import Iterable, Mapping
 import numpy as np
 
 from aepk_paging.coding import (
-    HammingSECDEDCode,
+    ReedSolomonCode,
+    ReedSolomonCodewords,
     UncorrectableError,
     encode_erasure_group,
+    encode_rs_erasure_group,
     recover_erasure,
+    recover_rs_erasure,
 )
 from aepk_paging.detect import attention_mass, attention_mass_detector, norm_consistency_detector, norm_ratio
 from aepk_paging.kv_page import KVPage, ResidencyTier
@@ -26,6 +29,8 @@ QUANT_NOISE_LEVEL = 0.35
 BIT_FLIP_P = 0.0008
 EVICTED_PAGE_ID = "p0"
 BIT_FLIP_PAGE_ID = "p1"
+RS_ERROR_T = 3          # RS(255, 255-2t) error-regime strength (real code, replaces toy SECDED t=1)
+RS_ERASURE_PARITY = 2   # Cauchy-RS parity pages -> recover up to 2 evicted pages (replaces XOR 1-erasure)
 LAMBDA_SWEEP = tuple(float(value) for value in np.logspace(0.0, 9.0, num=181))
 
 
@@ -34,7 +39,6 @@ class FaultScenario:
     clean_pages: tuple[KVPage, ...]
     quant_noisy_pages: Mapping[object, KVPage]
     raw_bitflip_page: KVPage
-    secded_bitflip_page: object
     evicted_page_id: object
     bit_flip_page_id: object
 
@@ -132,13 +136,10 @@ def make_fault_scenario(clean_pages: tuple[KVPage, ...]) -> FaultScenario:
     }
     bitflip_clean = _page_by_id(clean_pages, BIT_FLIP_PAGE_ID)
     raw_bitflip = bit_flip(quantize_page(bitflip_clean, bit_width=8), p=BIT_FLIP_P, seed=SEED + 200)
-    secded = HammingSECDEDCode().encode([quantize_page(bitflip_clean, bit_width=8)])[0]
-    secded_bitflip = bit_flip(secded, p=BIT_FLIP_P, seed=SEED + 200)
     return FaultScenario(
         clean_pages=clean_pages,
         quant_noisy_pages=noisy,
         raw_bitflip_page=raw_bitflip.dequantize(),
-        secded_bitflip_page=secded_bitflip,
         evicted_page_id=EVICTED_PAGE_ID,
         bit_flip_page_id=BIT_FLIP_PAGE_ID,
     )
@@ -404,58 +405,65 @@ def _run_full_aepk_stack(
     plan = manager.plan(
         clean_pages,
         budget_bits=budget_bits,
-        erasure_recovery_bound=1,
+        erasure_recovery_bound=RS_ERASURE_PARITY,
         flagged_page_ids=[page_id for page_id, flagged in detector_flags.items() if flagged],
         known_erasure_ids=[scenario.evicted_page_id],
     )
     tiers = {page_id: decision.tier for page_id, decision in plan.decisions.items()}
-    group = encode_erasure_group(clean_pages)
-    code = HammingSECDEDCode()
-    protected = code.encode([quantize_page(page, bit_width=8) for page in clean_pages])
-    protected_by_id = {page.page_id: page for page in protected}
-    protected_by_id[scenario.bit_flip_page_id] = scenario.secded_bitflip_page
-    try:
-        corrected = code.correct(tuple(protected_by_id.values()))
-    except UncorrectableError:
-        corrected = {}
 
+    # --- error regime: real Reed-Solomon RS(255, 255-2t) over each page's quantized values ---
+    rs = ReedSolomonCode(t=RS_ERROR_T)
+    quant_by_id = {page.page_id: quantize_page(page, bit_width=8) for page in clean_pages}
+    enc_K = {pid: rs.encode_array(q.K.values) for pid, q in quant_by_id.items()}
+    enc_V = {pid: rs.encode_array(q.V.values) for pid, q in quant_by_id.items()}
+    bf = scenario.bit_flip_page_id
+    corrected_values: dict[object, tuple[np.ndarray, np.ndarray]] = {}
+    try:
+        rec_K, _ = rs.correct_array(_bitflip_codewords(enc_K[bf], seed=SEED + 200))
+        rec_V, _ = rs.correct_array(_bitflip_codewords(enc_V[bf], seed=SEED + 201))
+        corrected_values[bf] = (rec_K, rec_V)
+    except UncorrectableError:
+        pass
+
+    # --- erasure regime: real Cauchy-Reed-Solomon MDS group (recovers up to RS_ERASURE_PARITY pages) ---
+    group = encode_rs_erasure_group(clean_pages, num_parity=RS_ERASURE_PARITY)
     missing_page_ids = {
         page.page_id
         for page in clean_pages
         if page.page_id == scenario.evicted_page_id or tiers[page.page_id] is ResidencyTier.EVICTED
     }
-    recovered_erasures: dict[object, KVPage] = {}
-    if len(missing_page_ids) == 1:
-        missing_id = next(iter(missing_page_ids))
-        recovered_erasures[missing_id] = recover_erasure(group, [missing_id])
+    try:
+        recovered_erasures = recover_rs_erasure(group, list(missing_page_ids))
+    except UncorrectableError:
+        recovered_erasures = {}
 
     outputs: dict[object, KVPage | None] = {}
     compute_proxy = 0.0
     for page in clean_pages:
         compute_proxy += 2.0
-        tier = tiers[page.page_id]
-        if page.page_id in missing_page_ids:
-            outputs[page.page_id] = recovered_erasures.get(page.page_id)
+        pid = page.page_id
+        tier = tiers[pid]
+        if pid in missing_page_ids:
+            outputs[pid] = recovered_erasures.get(pid)
             compute_proxy += 1.0
         elif tier is ResidencyTier.RESIDENT:
-            outputs[page.page_id] = page
-        elif page.page_id in corrected:
-            outputs[page.page_id] = corrected[page.page_id].dequantize()
+            outputs[pid] = page
+        elif pid in corrected_values:
+            rec_k, rec_v = corrected_values[pid]
+            outputs[pid] = _dequantize_from_values(quant_by_id[pid], rec_k, rec_v)
             compute_proxy += 1.0
-        elif flagged:
-            outputs[page.page_id] = quantize_page(page, bit_width=8).dequantize()
+        elif detector_flags[pid]:
+            outputs[pid] = quantize_page(page, bit_width=8).dequantize()
             compute_proxy += 1.0
         else:
-            outputs[page.page_id] = scenario.quant_noisy_pages[page.page_id]
+            outputs[pid] = scenario.quant_noisy_pages[pid]
 
     quality = _quality_loss(clean_pages, outputs)
-    parity_bits = int(group.parity_K.nbytes + group.parity_V.nbytes) * 8
-    raw_quant_bits = sum((page.K.size + page.V.size) * 8 for page in clean_pages)
-    protected_bits = sum(
-        (protected_page.K.values.size + protected_page.V.values.size) * 8
-        for protected_page in protected
-    )
-    syndrome_bits = int(protected_bits - raw_quant_bits)
+    parity_bits = int(group.parity_bytes.nbytes) * 8
+    syndrome_bits = 0
+    for pid in quant_by_id:
+        for enc in (enc_K[pid], enc_V[pid]):
+            syndrome_bits += int(enc.codewords.shape[0]) * (rs.n - rs.k) * 8  # 2t parity symbols/block
     fingerprint_bits = len(clean_pages) * 128
     storage_bits = parity_bits + syndrome_bits + fingerprint_bits + plan.total_storage_bits
     return (
@@ -465,7 +473,7 @@ def _run_full_aepk_stack(
             storage_bits=storage_bits,
             compute_proxy=compute_proxy,
             residual_error=quality,
-            notes="Detection + parity/SECDED recovery + thermodynamic residency decision.",
+            notes="Detection + Reed-Solomon error/erasure recovery + thermodynamic residency decision.",
         ),
         tiers,
         detector_flags,
@@ -480,6 +488,28 @@ def _detector_flags(scenario: FaultScenario) -> dict[object, bool]:
         norm = norm_consistency_detector(noisy, expected_ratio=norm_ratio(page), tolerance=0.01)
         flags[page.page_id] = mass.flag or norm.flag
     return flags
+
+
+def _bitflip_codewords(enc: ReedSolomonCodewords, seed: int) -> ReedSolomonCodewords:
+    rng = np.random.default_rng(seed)
+    bits = np.unpackbits(np.ascontiguousarray(enc.codewords).reshape(-1))
+    mask = rng.random(size=bits.shape) < BIT_FLIP_P
+    flipped = np.packbits(np.bitwise_xor(bits, mask.astype(np.uint8))).reshape(enc.codewords.shape)
+    return ReedSolomonCodewords(flipped, enc.original_len, enc.shape, enc.dtype)
+
+
+def _dequantize_from_values(quant, K_values: np.ndarray, V_values: np.ndarray) -> KVPage:
+    K = K_values.astype(np.float32) * np.float32(quant.K.scale)
+    V = V_values.astype(np.float32) * np.float32(quant.V.scale)
+    return KVPage(
+        page_id=quant.page_id,
+        layer=quant.layer,
+        token_range=quant.token_range,
+        K=K,
+        V=V,
+        precision_tag=f"dequantized-{quant.precision_tag}",
+        attention_mass=quant.attention_mass,
+    )
 
 
 def _quality_loss(clean_pages: Iterable[KVPage], outputs: Mapping[object, KVPage | None]) -> float:
