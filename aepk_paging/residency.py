@@ -137,6 +137,15 @@ class ResidencyManager:
         flagged_page_ids: Iterable[Hashable] = (),
         known_erasure_ids: Iterable[Hashable] = (),
     ) -> ResidencyPlan:
+        """Assign residency tiers minimizing free energy under a bit budget.
+
+        Priority note (V4): **recoverability overrides the budget.** When the budget is
+        too small to hold the minimum recoverable set, the plan keeps enough pages CODED
+        to respect `erasure_recovery_bound` (never leaving more EVICTED than the code can
+        rebuild) even if that means `total_storage_bits > budget_bits`. The returned
+        `total_storage_bits` always reports the TRUE storage, so callers/gates see the
+        honest number and can detect a budget overrun.
+        """
         if budget_bits < 0:
             raise ValueError("budget_bits must be non-negative")
         if erasure_recovery_bound < 0:

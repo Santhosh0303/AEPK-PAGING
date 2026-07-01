@@ -103,3 +103,12 @@ def fixed_kv_readout_logits(
     weights = weights / np.sum(weights)
     output = weights @ V
     return output @ head
+
+
+def finiteness_detector(page: KVPage) -> DetectorResult:
+    """Content-agnostic corruption check: valid KV is finite. Any NaN/inf in K or V
+    (e.g. an exponent bit-flip) is corruption -> flag. deviation = count of non-finite cells."""
+    nonfinite = int(
+        np.count_nonzero(~np.isfinite(page.K)) + np.count_nonzero(~np.isfinite(page.V))
+    )
+    return DetectorResult(flag=nonfinite > 0, deviation=float(nonfinite), tolerance=0.0)

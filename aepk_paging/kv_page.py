@@ -33,8 +33,8 @@ class KVPage:
             raise ValueError("K and V must have identical shapes")
         if self.layer < 0:
             raise ValueError("layer must be non-negative")
-        if self.attention_mass < 0.0:
-            raise ValueError("attention_mass must be non-negative")
+        if not np.isfinite(self.attention_mass) or self.attention_mass < 0.0:
+            raise ValueError("attention_mass must be a finite non-negative number")
         object.__setattr__(self, "K", np.array(self.K, copy=True))
         object.__setattr__(self, "V", np.array(self.V, copy=True))
 
