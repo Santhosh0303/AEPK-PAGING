@@ -31,11 +31,13 @@ from aepk_paging.harness.phase9_3_lc import (
     LC_N_PROBES_ITER,
     LC93aPoint,
     LC93aResult,
+    LC93cResult,
     LONG_CONTEXT_PASSAGE,
     LC_NOISE_LEVELS,
     assert_token_lengths,
     build_lc_probe_set,
     run_phase9_3a,
+    run_phase9_3c,
 )
 
 MODEL_ID = "Qwen/Qwen2.5-1.5B-Instruct"
@@ -275,4 +277,112 @@ class TestReport:
             print(
                 f"{pt.noise_level:>6.2f} | {pt.damage_only_retention:>7.4f} | "
                 f"{pt.recovery_on_retention:>7.4f}"
+            )
+
+
+# ---------------------------------------------------------------------------
+# Stage 9.3c — ablation fixture and tests
+# NOTE: TestAblation must come AFTER TestReport so that `iter_result` (9.3a)
+# runs and the byte-identical 9.3a test passes BEFORE `ablation_result`
+# overwrites the report with full 9.3c content.
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(scope="module")
+def ablation_result(model_and_tok, iter_result):
+    """Run 9.3c ablation using iter_result (9.3a data) for damage_only/ro_mse."""
+    model, tok = model_and_tok
+    return run_phase9_3c(
+        model, tok, DEVICE, DTYPE,
+        prev_93a=iter_result,
+        ablation_noise=[0.2, 0.3],
+        n_seeds=_ITER_SEEDS,
+    )
+
+
+class TestAblation:
+    """9.3c: strip RS / physics / detect bricks one at a time.
+
+    Gate (S9): ABLATION verdict line asserted to EXIST; its VALUE never asserted.
+    No Δ value compared to any threshold, sign, or specific number.
+    """
+
+    def test_ablation_result_type(self, ablation_result):
+        assert isinstance(ablation_result, LC93cResult)
+
+    def test_ablation_has_points(self, ablation_result):
+        assert len(ablation_result.points) > 0
+
+    def test_ablation_summary_keys(self, ablation_result):
+        keys = set(ablation_result.ablation_summary.keys())
+        assert {"coding", "physics", "detect"} <= keys
+
+    def test_ablation_summary_values_are_floats(self, ablation_result):
+        for k, v in ablation_result.ablation_summary.items():
+            assert isinstance(v, float), f"{k} is not float"
+
+    def test_ablation_line_exists_in_report(self, ablation_result):
+        """S9 gate (6): ABLATION line must exist — value never asserted."""
+        with open(ablation_result.report_path, encoding="utf-8") as f:
+            content = f.read()
+        assert "ABLATION:" in content, (
+            "ABLATION verdict line missing from REPORT_phase9_3_lc.md"
+        )
+
+    def test_ablation_line_has_coding_field(self, ablation_result):
+        with open(ablation_result.report_path, encoding="utf-8") as f:
+            content = f.read()
+        assert re.search(r"ABLATION:.*coding=[+-]?[\d.]+", content), (
+            "ABLATION line must contain coding=<±float>"
+        )
+
+    def test_ablation_line_has_physics_field(self, ablation_result):
+        with open(ablation_result.report_path, encoding="utf-8") as f:
+            content = f.read()
+        assert re.search(r"ABLATION:.*physics=[+-]?[\d.]+", content), (
+            "ABLATION line must contain physics=<±float>"
+        )
+
+    def test_ablation_line_has_detect_field(self, ablation_result):
+        with open(ablation_result.report_path, encoding="utf-8") as f:
+            content = f.read()
+        assert re.search(r"ABLATION:.*detect=[+-]?[\d.]+", content), (
+            "ABLATION line must contain detect=<±float>"
+        )
+
+    def test_lc_overrecovery_still_present(self, ablation_result):
+        """Full report must still contain LC_OVERRECOVERY from 9.3b."""
+        with open(ablation_result.report_path, encoding="utf-8") as f:
+            content = f.read()
+        assert "LC_OVERRECOVERY:" in content
+
+    def test_report_byte_identical_on_ablation_rerun(self, ablation_result, iter_result):
+        """_write_full_report_93c must produce identical bytes twice."""
+        from aepk_paging.harness.phase9_3_lc import _write_full_report_93c
+        with open(ablation_result.report_path, encoding="utf-8") as f:
+            original = f.read()
+        _write_full_report_93c(
+            iter_result,
+            ablation_result.points,
+            ablation_result.ablation_summary,
+            ablation_result.report_path,
+        )
+        with open(ablation_result.report_path, encoding="utf-8") as f:
+            rerun = f.read()
+        assert original == rerun, "Full report is NOT byte-identical across two writes"
+
+    def test_ablation_results_logged(self, ablation_result):
+        print(f"\n{'='*70}")
+        print("Phase 9.3c Ablation Results (REDUCED GRID)")
+        print(f"{'='*70}")
+        print(
+            f"Summary: coding={ablation_result.ablation_summary['coding']:+.4f}  "
+            f"physics={ablation_result.ablation_summary['physics']:+.4f}  "
+            f"detect={ablation_result.ablation_summary['detect']:+.4f}"
+        )
+        print(f"{'noise':>6} | {'Δcod':>7} | {'Δphy':>7} | {'Δdet':>7}")
+        print("-" * 40)
+        for pt in ablation_result.points:
+            print(
+                f"{pt.noise_level:>6.2f} | {pt.coding_delta:>+7.4f} | "
+                f"{pt.physics_delta:>+7.4f} | {pt.detect_delta:>+7.4f}"
             )
