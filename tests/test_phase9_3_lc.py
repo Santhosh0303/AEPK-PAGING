@@ -32,12 +32,14 @@ from aepk_paging.harness.phase9_3_lc import (
     LC93aPoint,
     LC93aResult,
     LC93cResult,
+    LC93dResult,
     LONG_CONTEXT_PASSAGE,
     LC_NOISE_LEVELS,
     assert_token_lengths,
     build_lc_probe_set,
     run_phase9_3a,
     run_phase9_3c,
+    run_phase9_3d,
 )
 
 MODEL_ID = "Qwen/Qwen2.5-1.5B-Instruct"
@@ -379,10 +381,161 @@ class TestAblation:
             f"physics={ablation_result.ablation_summary['physics']:+.4f}  "
             f"detect={ablation_result.ablation_summary['detect']:+.4f}"
         )
-        print(f"{'noise':>6} | {'Δcod':>7} | {'Δphy':>7} | {'Δdet':>7}")
+        print(f"{'noise':>6} | {'d_cod':>7} | {'d_phy':>7} | {'d_det':>7}")
         print("-" * 40)
         for pt in ablation_result.points:
             print(
                 f"{pt.noise_level:>6.2f} | {pt.coding_delta:>+7.4f} | "
                 f"{pt.physics_delta:>+7.4f} | {pt.detect_delta:>+7.4f}"
             )
+
+
+# ---------------------------------------------------------------------------
+# Stage 9.3d — KIVI/SnapKV fair fight on long context
+# NOTE: TestBaselines must come AFTER TestAblation so that 9.3c report content
+# is written before 9.3d overwrites the report with the final full content.
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(scope="module")
+def baseline_result(model_and_tok, iter_result, ablation_result):
+    """Run 9.3d fair fight using prev_93a + prev_93c data."""
+    model, tok = model_and_tok
+    return run_phase9_3d(
+        model, tok, DEVICE, DTYPE,
+        prev_93a=iter_result,
+        prev_93c=ablation_result,
+        n_probes=_ITER_PROBES,
+    )
+
+
+class TestBaselines:
+    """9.3d: KIVI-official + KIVI-2-small + SnapKV on LC probes (T=307-311).
+
+    Gate (S9): LC_BASELINE_DOMINANCE verdict line asserted to EXIST; its VALUE
+    never asserted. No verdict compared to DOMINATES_ALL or any specific string.
+    control_ok asserted True (KIVI-fp16 on LC must ≈ B0_lc ±0.05).
+    """
+
+    def test_baseline_result_type(self, baseline_result):
+        assert isinstance(baseline_result, LC93dResult)
+
+    def test_b0_lc_matches_iter(self, baseline_result, iter_result):
+        assert baseline_result.b0_lc == iter_result.b0_lc
+
+    def test_control_ok(self, baseline_result):
+        """KIVI-fp16-ctrl accuracy on LC must ≈ B0_lc (±0.05, small grid)."""
+        assert baseline_result.control_ok, (
+            f"KIVI-fp16-ctrl accuracy={baseline_result.kivi_fp16_ctrl.accuracy:.4f} "
+            f"not within ±0.05 of B0_lc={baseline_result.b0_lc:.4f}"
+        )
+
+    def test_aepk_accuracy_is_float(self, baseline_result):
+        assert isinstance(baseline_result.aepk_lc.accuracy, float)
+        assert 0.0 <= baseline_result.aepk_lc.accuracy <= 1.0
+
+    def test_kivi_2_official_accuracy_is_float(self, baseline_result):
+        assert isinstance(baseline_result.kivi_2_official.accuracy, float)
+        assert 0.0 <= baseline_result.kivi_2_official.accuracy <= 1.0
+
+    def test_kivi_2_small_accuracy_is_float(self, baseline_result):
+        assert isinstance(baseline_result.kivi_2_small.accuracy, float)
+        assert 0.0 <= baseline_result.kivi_2_small.accuracy <= 1.0
+
+    def test_snapkv_r50_accuracy_is_float(self, baseline_result):
+        assert isinstance(baseline_result.snapkv_r50.accuracy, float)
+        assert 0.0 <= baseline_result.snapkv_r50.accuracy <= 1.0
+
+    def test_bits_per_kv_elem_positive(self, baseline_result):
+        for comp in [
+            baseline_result.aepk_lc,
+            baseline_result.kivi_fp16_ctrl,
+            baseline_result.kivi_2_official,
+            baseline_result.kivi_2_small,
+            baseline_result.snapkv_r100_ctrl,
+            baseline_result.snapkv_r50,
+        ]:
+            assert comp.bits_per_kv_elem > 0.0, f"{comp.name}: bits_per_kv_elem <= 0"
+
+    def test_kivi_2_official_compresses_vs_fp16(self, baseline_result):
+        """On LC (T=307), KIVI-official must use fewer bits than fp16 ref."""
+        assert (
+            baseline_result.kivi_2_official.bits_per_kv_elem
+            < baseline_result.kivi_fp16_ctrl.bits_per_kv_elem
+        ), (
+            f"KIVI-2-official bits={baseline_result.kivi_2_official.bits_per_kv_elem:.2f} "
+            f"NOT less than fp16 ctrl bits={baseline_result.kivi_fp16_ctrl.bits_per_kv_elem:.2f}. "
+            "KIVI should compress at T=307 (group_size=32, residual_length=32 → 275 tokens quantized)."
+        )
+
+    def test_snapkv_r50_compresses_vs_r100(self, baseline_result):
+        """On LC (T=307), SnapKV-r50 must use fewer bits than r100 (T>window=32 → eviction)."""
+        assert (
+            baseline_result.snapkv_r50.bits_per_kv_elem
+            < baseline_result.snapkv_r100_ctrl.bits_per_kv_elem
+        ), (
+            f"SnapKV-r50 bits={baseline_result.snapkv_r50.bits_per_kv_elem:.2f} "
+            f"NOT less than r100 ctrl bits={baseline_result.snapkv_r100_ctrl.bits_per_kv_elem:.2f}. "
+            "SnapKV should evict at T=307 (window_size=32, keep_ratio=0.5)."
+        )
+
+    def test_dominance_verdict_is_str(self, baseline_result):
+        assert isinstance(baseline_result.dominance_verdict, str)
+        assert len(baseline_result.dominance_verdict) > 0
+
+    def test_dominance_verdict_in_valid_set(self, baseline_result):
+        valid = {"DOMINATES_ALL", "DOMINATES_SOME", "DOMINATED"}
+        assert baseline_result.dominance_verdict in valid, (
+            f"dominance_verdict={baseline_result.dominance_verdict!r} not in {valid}"
+        )
+
+    def test_lc_baseline_dominance_line_exists(self, baseline_result):
+        """S9 gate (6): LC_BASELINE_DOMINANCE line must exist — value never asserted."""
+        with open(baseline_result.report_path, encoding="utf-8") as f:
+            content = f.read()
+        assert "LC_BASELINE_DOMINANCE:" in content, (
+            "LC_BASELINE_DOMINANCE verdict line missing from REPORT_phase9_3_lc.md"
+        )
+
+    def test_lc_overrecovery_still_present(self, baseline_result):
+        with open(baseline_result.report_path, encoding="utf-8") as f:
+            content = f.read()
+        assert "LC_OVERRECOVERY:" in content
+
+    def test_ablation_still_present(self, baseline_result):
+        with open(baseline_result.report_path, encoding="utf-8") as f:
+            content = f.read()
+        assert "ABLATION:" in content
+
+    def test_report_byte_identical_on_93d_rerun(self, baseline_result, iter_result, ablation_result):
+        """_write_full_report_93d must produce identical bytes twice."""
+        from aepk_paging.harness.phase9_3_lc import _write_full_report_93d
+        with open(baseline_result.report_path, encoding="utf-8") as f:
+            original = f.read()
+        _write_full_report_93d(
+            iter_result,
+            ablation_result,
+            baseline_result,
+            baseline_result.report_path,
+        )
+        with open(baseline_result.report_path, encoding="utf-8") as f:
+            rerun = f.read()
+        assert original == rerun, "Final report is NOT byte-identical across two writes"
+
+    def test_baseline_results_logged(self, baseline_result):
+        print(f"\n{'='*70}")
+        print("Phase 9.3d Baseline Results (REDUCED GRID)")
+        print(f"{'='*70}")
+        print(f"B0_lc={baseline_result.b0_lc:.4f}")
+        print(f"Dominance verdict: {baseline_result.dominance_verdict}")
+        print(f"  vs_kivi={baseline_result.aepk_vs_kivi}  vs_snapkv={baseline_result.aepk_vs_snapkv}")
+        print(f"{'method':<22} | {'accuracy':>8} | {'bits/elem':>9} |")
+        print("-" * 50)
+        for comp in [
+            baseline_result.kivi_fp16_ctrl,
+            baseline_result.kivi_2_official,
+            baseline_result.kivi_2_small,
+            baseline_result.snapkv_r100_ctrl,
+            baseline_result.snapkv_r50,
+            baseline_result.aepk_lc,
+        ]:
+            print(f"{comp.name:<22} | {comp.accuracy:>8.4f} | {comp.bits_per_kv_elem:>9.2f} |")

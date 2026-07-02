@@ -6,7 +6,7 @@ Stage 9.3a: Build shared long-context probe set; assert T>=150; measure fresh
 Stage 9.3b: Emit LC_OVERRECOVERY verdict from 9.3a data at noise 0.2/0.3.
 Stage 9.3c: ABLATION — strip RS coding / physics (→uniform) / detection one at
             a time; emit ABLATION: coding=<Δ> physics=<Δ> detect=<Δ>.
-Stage 9.3d: KIVI/SnapKV fair fight on long context — reserved.
+Stage 9.3d: KIVI/SnapKV fair fight on long context; emit LC_BASELINE_DOMINANCE.
 
 ROOT PROBLEM fixed here (HITL 2026-07-02): 9.1 and 9.2 used SHORT prompts
 (T=7-25), flattering AEPK twice:
@@ -49,6 +49,13 @@ from aepk_paging.harness.phase9_accuracy import (
     build_extended_eval_set,
 )
 from aepk_paging.harness.phase7_quality import _inject_pages
+from aepk_paging.harness.phase9_baselines import (
+    BaselineComparison,
+    _dominance,
+    _run_aepk_b3_full,
+    _run_kivi_accuracy,
+    _run_snapkv_accuracy,
+)
 from aepk_paging.lossy_tier import quant_noise
 from aepk_paging.real_model_adapter import dynamiccache_to_pages
 
@@ -729,6 +736,298 @@ def _write_full_report_93c(
         f"Ablation levels: {[pt.noise_level for pt in pts_93c]}",
         "",
         ablation_line,
+    ]
+
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+
+
+# ---------------------------------------------------------------------------
+# Stage 9.3d — Fair fight: KIVI + SnapKV on long context (they now engage)
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class LC93dResult:
+    b0_lc: float
+    aepk_lc: BaselineComparison       # AEPK on LC at noise=0.2
+    kivi_fp16_ctrl: BaselineComparison
+    kivi_2_official: BaselineComparison
+    kivi_2_small: BaselineComparison
+    snapkv_r100_ctrl: BaselineComparison
+    snapkv_r50: BaselineComparison
+    dominance_verdict: str   # DOMINATES_ALL | DOMINATES_SOME | DOMINATED (runtime)
+    aepk_vs_kivi: str        # AEPK_WINS | KIVI_WINS | TIED | KIVI_NOT_APPLICABLE
+    aepk_vs_snapkv: str      # AEPK_WINS | SNAPKV_WINS | TIED | SNAPKV_NOT_APPLICABLE
+    control_ok: bool
+    report_path: str
+
+
+def run_phase9_3d(
+    model,
+    tok,
+    device: str,
+    dtype,
+    prev_93a: LC93aResult,
+    prev_93c: LC93cResult,
+    n_probes: int | None = None,
+) -> LC93dResult:
+    """Fair fight: KIVI-official + KIVI-2-small + SnapKV on LC probes (T=307-311).
+
+    At T=307 both methods now actually compress:
+      KIVI-official (group_size=32, residual_length=32): 275 tokens quantized to 2-bit.
+      SnapKV-r50 (window_size=32): 137 of 275 non-window positions evicted.
+
+    Uses OFFICIAL Phase 9.2 configs (LOCKED; not changed here):
+      KIVI-official: k_bits=2, v_bits=2, group_size=32, residual_length=32
+      KIVI-2-small:  k_bits=2, v_bits=2, group_size=4, residual_length=0
+      SnapKV:        window_size=32; keep_ratio 1.0 (control), 0.5
+
+    Emits LC_BASELINE_DOMINANCE verdict (S9 gate 5: runtime expression).
+    Writes the FINAL report (9.3a + 9.3b + 9.3c + 9.3d).
+    """
+    lc_probes_all = build_lc_probe_set()
+    n = prev_93a.n_probes if n_probes is None else n_probes
+    lc_probes = lc_probes_all[:n]
+
+    def _pct(bits: float) -> float:
+        return bits / 16.0
+
+    # --- AEPK B3 on LC at noise=0.2 (fresh measurement with residency) ---
+    aepk_acc, aepk_bits = _run_aepk_b3_full(
+        model, tok, device, dtype, lc_probes, noise_level=0.2,
+    )
+    aepk_lc = BaselineComparison(
+        "AEPK_B3_LC_noise02", aepk_acc, aepk_bits, _pct(aepk_bits),
+    )
+
+    # --- KIVI on LC (SDPA model) ---
+    kivi_fp16_acc, kivi_fp16_bits = _run_kivi_accuracy(
+        model, tok, device, dtype, lc_probes,
+        k_bits=16, v_bits=16, group_size=32, residual_length=0,
+    )
+    kivi_fp16_ctrl = BaselineComparison(
+        "KIVI_fp16_control", kivi_fp16_acc, kivi_fp16_bits, _pct(kivi_fp16_bits),
+    )
+
+    kivi2_off_acc, kivi2_off_bits = _run_kivi_accuracy(
+        model, tok, device, dtype, lc_probes,
+        k_bits=2, v_bits=2, group_size=32, residual_length=32,
+    )
+    kivi_2_official = BaselineComparison(
+        "KIVI_2_official", kivi2_off_acc, kivi2_off_bits, _pct(kivi2_off_bits),
+    )
+
+    kivi2_sm_acc, kivi2_sm_bits = _run_kivi_accuracy(
+        model, tok, device, dtype, lc_probes,
+        k_bits=2, v_bits=2, group_size=4, residual_length=0,
+    )
+    kivi_2_small = BaselineComparison(
+        "KIVI_2_small_g4", kivi2_sm_acc, kivi2_sm_bits, _pct(kivi2_sm_bits),
+    )
+
+    # Control: KIVI-fp16 accuracy on LC should ≈ B0_lc (±0.05 tolerance for small grid)
+    control_ok = abs(kivi_fp16_acc - prev_93a.b0_lc) <= 0.05
+
+    # --- SnapKV on LC (requires BF16 eager model) ---
+    snap_r100_ctrl: BaselineComparison
+    snap_r50: BaselineComparison
+    model_eager = None
+    try:
+        from transformers import AutoModelForCausalLM as _AMCL
+        model_eager = _AMCL.from_pretrained(
+            "Qwen/Qwen2.5-1.5B-Instruct",
+            dtype=torch.bfloat16,
+            device_map=device,
+            attn_implementation="eager",
+        )
+        model_eager.eval()
+
+        r100_acc, r100_bits = _run_snapkv_accuracy(
+            model_eager, tok, device, dtype, lc_probes,
+            window_size=32, keep_ratio=1.0,
+        )
+        snap_r100_ctrl = BaselineComparison(
+            "SnapKV_r100_control", r100_acc, r100_bits, _pct(r100_bits),
+        )
+
+        r50_acc, r50_bits = _run_snapkv_accuracy(
+            model_eager, tok, device, dtype, lc_probes,
+            window_size=32, keep_ratio=0.50,
+        )
+        snap_r50 = BaselineComparison(
+            "SnapKV_r50", r50_acc, r50_bits, _pct(r50_bits),
+        )
+    finally:
+        if model_eager is not None:
+            del model_eager
+            if device == "cuda":
+                torch.cuda.empty_cache()
+
+    # --- Dominance verdict — S9 gate (5): runtime expression ---
+    comparisons = [kivi_2_official, kivi_2_small, snap_r50]
+    overall, vs_kivi, vs_snapkv = _dominance(aepk_lc, comparisons, prev_93a.b0_lc)
+
+    report_path = os.path.join("results", "REPORT_phase9_3_lc.md")
+    r93d = LC93dResult(
+        b0_lc=prev_93a.b0_lc,
+        aepk_lc=aepk_lc,
+        kivi_fp16_ctrl=kivi_fp16_ctrl,
+        kivi_2_official=kivi_2_official,
+        kivi_2_small=kivi_2_small,
+        snapkv_r100_ctrl=snap_r100_ctrl,
+        snapkv_r50=snap_r50,
+        dominance_verdict=overall,
+        aepk_vs_kivi=vs_kivi,
+        aepk_vs_snapkv=vs_snapkv,
+        control_ok=control_ok,
+        report_path=report_path,
+    )
+    _write_full_report_93d(prev_93a, prev_93c, r93d, report_path)
+    return r93d
+
+
+def _write_full_report_93d(
+    r93a: LC93aResult,
+    r93c: LC93cResult,
+    r93d: LC93dResult,
+    path: str,
+) -> None:
+    """Write FINAL REPORT_phase9_3_lc.md (9.3a + 9.3b + 9.3c + 9.3d).
+
+    All verdict lines (LC_OVERRECOVERY, ABLATION, LC_BASELINE_DOMINANCE) are
+    runtime expressions derived from measured data — never hardcoded literals.
+    Byte-identical across two calls with identical inputs.
+    """
+    # --- Re-derive 9.3b LC_OVERRECOVERY from 9.3a data ---
+    interp_pts = [p for p in r93a.points if p.noise_level in (0.2, 0.3)]
+    if interp_pts:
+        worst_pt = max(interp_pts, key=lambda p: p.noise_level)
+        lc_overrecovery_line = (
+            f"LC_OVERRECOVERY: noise={worst_pt.noise_level} "
+            f"damage_only={worst_pt.damage_only_retention:.4f} "
+            f"recovery_on={worst_pt.recovery_on_retention:.4f}"
+        )
+    elif r93a.points:
+        fb = max(r93a.points, key=lambda p: p.noise_level)
+        lc_overrecovery_line = (
+            f"LC_OVERRECOVERY: noise={fb.noise_level} "
+            f"damage_only={fb.damage_only_retention:.4f} "
+            f"recovery_on={fb.recovery_on_retention:.4f}"
+        )
+    else:
+        lc_overrecovery_line = "LC_OVERRECOVERY: noise=N/A no_points"
+
+    # --- 9.3c ABLATION line (runtime from summary) ---
+    s = r93c.ablation_summary
+    ablation_line = (
+        f"ABLATION: coding={s['coding']:+.4f} "
+        f"physics={s['physics']:+.4f} "
+        f"detect={s['detect']:+.4f}"
+    )
+
+    # --- 9.3d LC_BASELINE_DOMINANCE (runtime from measured verdict) ---
+    dominance_line = (
+        f"LC_BASELINE_DOMINANCE: {r93d.dominance_verdict} "
+        f"(vs_kivi={r93d.aepk_vs_kivi} vs_snapkv={r93d.aepk_vs_snapkv})"
+    )
+
+    lines = [
+        "# REPORT_phase9_3_lc.md — Phase 9.3-LC Long-Context Ablation",
+        "",
+        "Model: Qwen/Qwen2.5-1.5B-Instruct fp16 (CUDA)",
+        f"Probes: {r93a.n_probes} long-context (LONG_CONTEXT_PASSAGE prepended)",
+        f"Token length: min_T={r93a.min_token_length} max_T={r93a.max_token_length} (ALL >= 150)",
+        f"Seeds per cell: {r93a.n_seeds}",
+        f"B0_lc: {r93a.b0_lc:.4f}  (freshly measured; NOT the short-prompt 0.330)",
+        "",
+        "## Root problem (HITL 2026-07-02)",
+        "9.1 and 9.2 used SHORT prompts (T=7-25):",
+        "  (a) RS over-recovers: few-token pages have tiny MSE → trivially restored.",
+        "  (b) KIVI/SnapKV fall back to fp16 at T<32 → never compress → inert win.",
+        "Long-context (T>=150) forces RS to compete against 28 high-noise pages.",
+        "",
+        "## Stage 9.3a — damage_only vs recovery_on on long context",
+        "",
+        "damage_only: quant_noise applied; NO recover_rs_erasure call.",
+        "recovery_on: quant_noise applied; recover_rs_erasure(worst-2 by MSE).",
+        "noise=0.0: control row — both retentions must equal 1.0 (bit-exact).",
+        "",
+        "| noise | damage_only_ret | ±ci | recovery_on_ret | ±ci |",
+        "|-------|----------------|-----|----------------|-----|",
+    ]
+    for pt in r93a.points:
+        lines.append(
+            f"| {pt.noise_level:.2f} | {pt.damage_only_retention:.4f} | "
+            f"±{pt.damage_only_ci:.4f} | {pt.recovery_on_retention:.4f} | "
+            f"±{pt.recovery_on_ci:.4f} |"
+        )
+
+    lines += [
+        "",
+        "## Stage 9.3b — LC_OVERRECOVERY interpretation",
+        "",
+        lc_overrecovery_line,
+        "",
+        "## Stage 9.3c — Ablation: strip bricks one at a time",
+        "",
+        "Bricks compared at each ablation noise level:",
+        "  damage_only  : RS OFF, no page selection.",
+        "  ro_mse       : RS ON, recover worst-2 by MSE (AEPK physics proxy).",
+        "  ro_uniform   : RS ON, recover 2 random pages (no physics signal).",
+        "  ro_detector  : RS ON, recover 2 highest-deviation (Phase 4 detector).",
+        "",
+        "Δ coding = ro_mse - damage_only   (RS ON vs OFF; positive = RS helps).",
+        "Δ physics = ro_mse - ro_uniform    (MSE-guided vs random; positive = MSE helps).",
+        "Δ detect  = ro_detector - ro_mse   (detector vs MSE; positive = detector helps).",
+        "",
+        "| noise | do_ret | ro_mse | ro_uni | ro_det | Δcoding | Δphysics | Δdetect |",
+        "|-------|--------|--------|--------|--------|---------|----------|---------|",
+    ]
+    for pt in r93c.points:
+        lines.append(
+            f"| {pt.noise_level:.2f} | {pt.damage_only_retention:.4f} | "
+            f"{pt.ro_mse_retention:.4f} | {pt.ro_uniform_retention:.4f} | "
+            f"{pt.ro_detector_retention:.4f} | "
+            f"{pt.coding_delta:+.4f} | {pt.physics_delta:+.4f} | {pt.detect_delta:+.4f} |"
+        )
+
+    lines += [
+        "",
+        f"Ablation levels: {[pt.noise_level for pt in r93c.points]}",
+        "",
+        ablation_line,
+        "",
+        "## Stage 9.3d — Fair fight: KIVI + SnapKV on long context",
+        "",
+        "At T=307: KIVI-official compresses 275 tokens to 2-bit (group_size=32).",
+        "At T=307: SnapKV-r50 evicts 137 of 275 non-window positions (window=32).",
+        f"9.3d probes: {r93d.kivi_fp16_ctrl.accuracy:.0%} clean accuracy reference",
+        "",
+        "| method                | accuracy | bits/elem | storage% |",
+        "|----------------------|----------|-----------|----------|",
+        f"| KIVI_fp16_control    | {r93d.kivi_fp16_ctrl.accuracy:.4f}   | "
+        f"{r93d.kivi_fp16_ctrl.bits_per_kv_elem:9.2f} | "
+        f"{r93d.kivi_fp16_ctrl.storage_pct:.3f}    |",
+        f"| KIVI_2_official      | {r93d.kivi_2_official.accuracy:.4f}   | "
+        f"{r93d.kivi_2_official.bits_per_kv_elem:9.2f} | "
+        f"{r93d.kivi_2_official.storage_pct:.3f}    |",
+        f"| KIVI_2_small_g4      | {r93d.kivi_2_small.accuracy:.4f}   | "
+        f"{r93d.kivi_2_small.bits_per_kv_elem:9.2f} | "
+        f"{r93d.kivi_2_small.storage_pct:.3f}    |",
+        f"| SnapKV_r100_control  | {r93d.snapkv_r100_ctrl.accuracy:.4f}   | "
+        f"{r93d.snapkv_r100_ctrl.bits_per_kv_elem:9.2f} | "
+        f"{r93d.snapkv_r100_ctrl.storage_pct:.3f}    |",
+        f"| SnapKV_r50           | {r93d.snapkv_r50.accuracy:.4f}   | "
+        f"{r93d.snapkv_r50.bits_per_kv_elem:9.2f} | "
+        f"{r93d.snapkv_r50.storage_pct:.3f}    |",
+        f"| AEPK_B3_LC_noise02   | {r93d.aepk_lc.accuracy:.4f}   | "
+        f"{r93d.aepk_lc.bits_per_kv_elem:9.2f} | "
+        f"{r93d.aepk_lc.storage_pct:.3f}    |",
+        "",
+        f"control_ok: {r93d.control_ok}",
+        "",
+        dominance_line,
     ]
 
     os.makedirs(os.path.dirname(path), exist_ok=True)

@@ -48,3 +48,22 @@ Bricks compared at each ablation noise level:
 Ablation levels: [0.2, 0.3]
 
 ABLATION: coding=+0.0000 physics=+0.0000 detect=-0.0000
+
+## Stage 9.3d — Fair fight: KIVI + SnapKV on long context
+
+At T=307: KIVI-official compresses 275 tokens to 2-bit (group_size=32).
+At T=307: SnapKV-r50 evicts 137 of 275 non-window positions (window=32).
+9.3d probes: 80% clean accuracy reference
+
+| method                | accuracy | bits/elem | storage% |
+|----------------------|----------|-----------|----------|
+| KIVI_fp16_control    | 0.8000   |     16.00 | 1.000    |
+| KIVI_2_official      | 0.8000   |      5.20 | 0.325    |
+| KIVI_2_small_g4      | 0.7000   |     10.05 | 0.628    |
+| SnapKV_r100_control  | 0.6000   |     16.00 | 1.000    |
+| SnapKV_r50           | 0.4000   |      8.81 | 0.550    |
+| AEPK_B3_LC_noise02   | 0.8000   |      3.14 | 0.196    |
+
+control_ok: True
+
+LC_BASELINE_DOMINANCE: DOMINATES_SOME (vs_kivi=AEPK_WINS vs_snapkv=SNAPKV_NOT_APPLICABLE)
