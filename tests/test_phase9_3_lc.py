@@ -12,7 +12,7 @@ Gate (honesty spine S9 — never violated):
     (Python can't observe call counts without mocking), but the source structure
     guarantees it (recover_rs_erasure gated by 'if use_recovery:' only).
 
-Fixture scope: module (model loaded once; reduced grid runs once).
+Fixture scope: module (model loaded once; full grid runs once).
 """
 
 from __future__ import annotations
@@ -46,10 +46,10 @@ MODEL_ID = "Qwen/Qwen2.5-1.5B-Instruct"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE = torch.float16 if DEVICE == "cuda" else torch.float32
 
-# Reduced grid for fast iteration — not the full grid
+# 9.3-LC-2: full grid (N_PROBES=100, N_SEEDS=5, noise=[0.0,0.2,0.3]) — powered, not the old reduced grid
 _ITER_NOISE = [0.0, 0.2, 0.3]
-_ITER_SEEDS = 2
-_ITER_PROBES = LC_N_PROBES_ITER   # 10
+_ITER_SEEDS = 5
+_ITER_PROBES = LC_N_PROBES_ITER   # 100
 
 
 @pytest.fixture(scope="module")
@@ -65,7 +65,7 @@ def model_and_tok():
 
 @pytest.fixture(scope="module")
 def iter_result(model_and_tok):
-    """Reduced-grid result: 10 probes, 2 seeds, noise=[0.0, 0.2, 0.3]."""
+    """Full-grid result: 100 probes, 5 seeds, noise=[0.0, 0.2, 0.3]."""
     model, tok = model_and_tok
     return run_phase9_3a(
         model, tok, DEVICE, DTYPE,

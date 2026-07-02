@@ -263,7 +263,7 @@ class LC93aResult:
 # ---------------------------------------------------------------------------
 LC_NOISE_LEVELS = [0.0, 0.05, 0.1, 0.2, 0.3, 0.5]
 LC_N_SEEDS = 5
-LC_N_PROBES_ITER = 10   # reduced-grid probe count for fast iteration
+LC_N_PROBES_ITER = 100   # 9.3-LC-2: full-grid probe count (was 10 in the underpowered run)
 
 
 # ---------------------------------------------------------------------------
