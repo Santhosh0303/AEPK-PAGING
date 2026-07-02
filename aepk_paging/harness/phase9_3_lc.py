@@ -42,7 +42,7 @@ import numpy as np
 import torch
 
 from aepk_paging.coding import encode_rs_erasure_group, recover_rs_erasure
-from aepk_paging.detect import attention_mass_detector
+from aepk_paging.detect import attention_mass, attention_mass_detector
 from aepk_paging.harness.eval_set import normalized_match
 from aepk_paging.harness.phase9_accuracy import (
     _greedy_from_prefill_out,
@@ -56,7 +56,8 @@ from aepk_paging.harness.phase9_baselines import (
     _run_kivi_accuracy,
     _run_snapkv_accuracy,
 )
-from aepk_paging.lossy_tier import quant_noise
+from aepk_paging.kv_page import KVPage
+from aepk_paging.lossy_tier import forced_evict, quant_noise
 from aepk_paging.real_model_adapter import dynamiccache_to_pages
 
 # ---------------------------------------------------------------------------
@@ -737,6 +738,360 @@ def _write_full_report_93c(
         "",
         ablation_line,
     ]
+
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+
+
+# ---------------------------------------------------------------------------
+# Stage 9.3-LC-2 (erasure) — total page-loss regime, the make-or-break test.
+#
+# quant_noise (used in 9.3a/b/c) barely dents LC task accuracy (damage_only
+# ~0.95-1.0), so the ERROR regime cannot demonstrate RS recovery's value —
+# there is little damage to recover from. Erasure (total page loss, K/V
+# zeroed) is the regime where RS recovery is *deterministically necessary*:
+# a zeroed page cannot be regenerated from context, only reconstructed from
+# parity. This isolates whether self-healing has any demonstrable value.
+#
+# Mechanics (fixed by spec, not tunable):
+#   - top-k pages by detect.attention_mass(page) selected for erasure
+#     (deterministic; no RNG involved anywhere in this stage).
+#   - damage_only: erased pages' K,V set to zero (total loss) via
+#     forced_evict-style zeroing; recover_rs_erasure is NEVER called.
+#   - recovery_on: encode_rs_erasure_group(pages, num_parity=erased_k)
+#     BEFORE damage; then recover_rs_erasure(group, evicted_ids) restores
+#     the erased pages bit-exact before injection.
+#   - erased_k=0 is the control (no pages erased; both paths == B0_lc).
+#
+# No seeds: unlike quant_noise, zeroing has no RNG — the same erased_k
+# yields byte-identical damage every run, so repeating over seeds would
+# only re-measure the same number. n_seeds is therefore fixed at 1 here
+# (documented, not silently dropped) rather than wasting 5x GPU time
+# re-computing an identical result.
+# ---------------------------------------------------------------------------
+
+def _run_lc_erasure(
+    model,
+    tok,
+    device: str,
+    dtype,
+    lc_probes: list[dict],
+    erased_k: int,
+    use_recovery: bool,
+) -> float:
+    """Task accuracy on long-context probes under total page-loss (erasure).
+
+    erased_k=0: no pages erased (control) — both use_recovery values must
+    give retention == 1.0 == B0_lc.
+
+    use_recovery=False (damage_only): the top-erased_k pages by
+    detect.attention_mass are zeroed via forced_evict-style eviction.
+    recover_rs_erasure is NEVER called on this path.
+
+    use_recovery=True (recovery_on): encode_rs_erasure_group(pages,
+    num_parity=erased_k) is computed BEFORE damage from the clean pages;
+    the same top-erased_k pages are zeroed; recover_rs_erasure restores
+    them bit-exact (erased_k == num_parity is exactly at the recovery
+    bound) before injection.
+    """
+    model.eval()
+    correct = 0
+    for p in lc_probes:
+        ids = tok(p["prompt"], return_tensors="pt").input_ids.to(device)
+        with torch.no_grad():
+            out = model(ids, use_cache=True)
+        pkv = out.past_key_values
+        pages = dynamiccache_to_pages(pkv)
+
+        if erased_k == 0:
+            damaged: list = list(pages)
+        else:
+            # Deterministic top-k selection by attention_mass (descending;
+            # ties broken by page index for reproducibility).
+            scored = sorted(
+                range(len(pages)),
+                key=lambda i: (-attention_mass(pages[i]), i),
+            )
+            erase_idx = scored[:erased_k]
+            erase_ids = [pages[i].page_id for i in erase_idx]
+            evicted_ids = forced_evict(erase_ids)
+
+            rs_group = None
+            if use_recovery:
+                rs_group = encode_rs_erasure_group(pages, num_parity=erased_k)
+
+            damaged = list(pages)
+            for i in erase_idx:
+                pg = pages[i]
+                damaged[i] = KVPage(
+                    page_id=pg.page_id,
+                    layer=pg.layer,
+                    token_range=pg.token_range,
+                    K=np.zeros_like(pg.K),
+                    V=np.zeros_like(pg.V),
+                    precision_tag=f"{pg.precision_tag}+erased",
+                    attention_mass=0.0,
+                )
+
+            if use_recovery:
+                rec = recover_rs_erasure(rs_group, evicted_ids)
+                for pid, rpage in rec.items():
+                    idx2 = next(j for j, pg2 in enumerate(pages) if pg2.page_id == pid)
+                    damaged[idx2] = rpage
+            # damage_only path: recover_rs_erasure is never called above.
+
+        _inject_pages(pkv, damaged, dtype, device)
+        pred = _greedy_from_prefill_out(model, tok, out, pkv)
+        if normalized_match(pred, p["expected"], p.get("alternatives")):
+            correct += 1
+
+    return correct / len(lc_probes)
+
+
+@dataclass(frozen=True)
+class LCErasurePoint:
+    erased_k: int
+    damage_only_acc: float
+    recovery_on_acc: float
+    damage_only_ret: float   # damage_only_acc / b0_lc
+    recovery_on_ret: float   # recovery_on_acc / b0_lc
+
+
+@dataclass(frozen=True)
+class LC93eResult:
+    b0_lc: float
+    n_probes: int
+    points: list[LCErasurePoint]
+    report_path: str
+
+
+def run_phase9_3_erasure(
+    model,
+    tok,
+    device: str,
+    dtype,
+    prev_93a: LC93aResult,
+    prev_93c: LC93cResult,
+    prev_93d: LC93dResult,
+    erased_ks: list[int] | None = None,
+    n_probes: int | None = None,
+) -> LC93eResult:
+    """Sweep erased_k in [0,2,4,8]; emit ERASURE_HEAL verdict per k.
+
+    Uses prev_93a.b0_lc (same probe subset) as the retention denominator.
+    Writes the FULL report (9.3a + 9.3b + 9.3c + 9.3d + erasure).
+    """
+    if erased_ks is None:
+        erased_ks = [0, 2, 4, 8]
+
+    lc_probes_all = build_lc_probe_set()
+    n = prev_93a.n_probes if n_probes is None else n_probes
+    lc_probes = lc_probes_all[:n]
+
+    safe_b0 = prev_93a.b0_lc if prev_93a.b0_lc > 0.0 else 1.0
+
+    points: list[LCErasurePoint] = []
+    for k in erased_ks:
+        do_acc = _run_lc_erasure(
+            model, tok, device, dtype, lc_probes, erased_k=k, use_recovery=False,
+        )
+        ro_acc = _run_lc_erasure(
+            model, tok, device, dtype, lc_probes, erased_k=k, use_recovery=True,
+        )
+        points.append(LCErasurePoint(
+            erased_k=k,
+            damage_only_acc=do_acc,
+            recovery_on_acc=ro_acc,
+            damage_only_ret=do_acc / safe_b0,
+            recovery_on_ret=ro_acc / safe_b0,
+        ))
+
+    report_path = os.path.join("results", "REPORT_phase9_3_lc.md")
+    r93e = LC93eResult(
+        b0_lc=prev_93a.b0_lc,
+        n_probes=n,
+        points=points,
+        report_path=report_path,
+    )
+    _write_full_report_93e(prev_93a, prev_93c, prev_93d, r93e, report_path)
+    return r93e
+
+
+def _erasure_heal_lines(points: list[LCErasurePoint]) -> list[str]:
+    """S9 gate (5): one ERASURE_HEAL line per k, all runtime expressions."""
+    return [
+        f"ERASURE_HEAL: erased={pt.erased_k} "
+        f"damage_only_ret={pt.damage_only_ret:.4f} "
+        f"recovery_on_ret={pt.recovery_on_ret:.4f}"
+        for pt in points
+    ]
+
+
+def _write_full_report_93e(
+    r93a: LC93aResult,
+    r93c: LC93cResult,
+    r93d: LC93dResult,
+    r93e: LC93eResult,
+    path: str,
+) -> None:
+    """Write FINAL REPORT_phase9_3_lc.md (9.3a + 9.3b + 9.3c + 9.3d + erasure).
+
+    All verdict lines are runtime expressions derived from measured data —
+    never hardcoded literals. Byte-identical across two calls with
+    identical inputs.
+    """
+    interp_pts = [p for p in r93a.points if p.noise_level in (0.2, 0.3)]
+    if interp_pts:
+        worst_pt = max(interp_pts, key=lambda p: p.noise_level)
+        lc_overrecovery_line = (
+            f"LC_OVERRECOVERY: noise={worst_pt.noise_level} "
+            f"damage_only={worst_pt.damage_only_retention:.4f} "
+            f"recovery_on={worst_pt.recovery_on_retention:.4f}"
+        )
+    elif r93a.points:
+        fb = max(r93a.points, key=lambda p: p.noise_level)
+        lc_overrecovery_line = (
+            f"LC_OVERRECOVERY: noise={fb.noise_level} "
+            f"damage_only={fb.damage_only_retention:.4f} "
+            f"recovery_on={fb.recovery_on_retention:.4f}"
+        )
+    else:
+        lc_overrecovery_line = "LC_OVERRECOVERY: noise=N/A no_points"
+
+    s = r93c.ablation_summary
+    ablation_line = (
+        f"ABLATION: coding={s['coding']:+.4f} "
+        f"physics={s['physics']:+.4f} "
+        f"detect={s['detect']:+.4f}"
+    )
+
+    dominance_line = (
+        f"LC_BASELINE_DOMINANCE: {r93d.dominance_verdict} "
+        f"(vs_kivi={r93d.aepk_vs_kivi} vs_snapkv={r93d.aepk_vs_snapkv})"
+    )
+
+    erasure_lines = _erasure_heal_lines(r93e.points)
+
+    lines = [
+        "# REPORT_phase9_3_lc.md — Phase 9.3-LC Long-Context Ablation",
+        "",
+        "Model: Qwen/Qwen2.5-1.5B-Instruct fp16 (CUDA)",
+        f"Probes: {r93a.n_probes} long-context (LONG_CONTEXT_PASSAGE prepended)",
+        f"Token length: min_T={r93a.min_token_length} max_T={r93a.max_token_length} (ALL >= 150)",
+        f"Seeds per cell: {r93a.n_seeds}",
+        f"B0_lc: {r93a.b0_lc:.4f}  (freshly measured; NOT the short-prompt 0.330)",
+        "",
+        "## Root problem (HITL 2026-07-02)",
+        "9.1 and 9.2 used SHORT prompts (T=7-25):",
+        "  (a) RS over-recovers: few-token pages have tiny MSE → trivially restored.",
+        "  (b) KIVI/SnapKV fall back to fp16 at T<32 → never compress → inert win.",
+        "Long-context (T>=150) forces RS to compete against 28 high-noise pages.",
+        "",
+        "## Stage 9.3a — damage_only vs recovery_on on long context",
+        "",
+        "damage_only: quant_noise applied; NO recover_rs_erasure call.",
+        "recovery_on: quant_noise applied; recover_rs_erasure(worst-2 by MSE).",
+        "noise=0.0: control row — both retentions must equal 1.0 (bit-exact).",
+        "",
+        "| noise | damage_only_ret | ±ci | recovery_on_ret | ±ci |",
+        "|-------|----------------|-----|----------------|-----|",
+    ]
+    for pt in r93a.points:
+        lines.append(
+            f"| {pt.noise_level:.2f} | {pt.damage_only_retention:.4f} | "
+            f"±{pt.damage_only_ci:.4f} | {pt.recovery_on_retention:.4f} | "
+            f"±{pt.recovery_on_ci:.4f} |"
+        )
+
+    lines += [
+        "",
+        "## Stage 9.3b — LC_OVERRECOVERY interpretation",
+        "",
+        lc_overrecovery_line,
+        "",
+        "## Stage 9.3c — Ablation: strip bricks one at a time",
+        "",
+        "Bricks compared at each ablation noise level:",
+        "  damage_only  : RS OFF, no page selection.",
+        "  ro_mse       : RS ON, recover worst-2 by MSE (AEPK physics proxy).",
+        "  ro_uniform   : RS ON, recover 2 random pages (no physics signal).",
+        "  ro_detector  : RS ON, recover 2 highest-deviation (Phase 4 detector).",
+        "",
+        "Δ coding = ro_mse - damage_only   (RS ON vs OFF; positive = RS helps).",
+        "Δ physics = ro_mse - ro_uniform    (MSE-guided vs random; positive = MSE helps).",
+        "Δ detect  = ro_detector - ro_mse   (detector vs MSE; positive = detector helps).",
+        "",
+        "| noise | do_ret | ro_mse | ro_uni | ro_det | Δcoding | Δphysics | Δdetect |",
+        "|-------|--------|--------|--------|--------|---------|----------|---------|",
+    ]
+    for pt in r93c.points:
+        lines.append(
+            f"| {pt.noise_level:.2f} | {pt.damage_only_retention:.4f} | "
+            f"{pt.ro_mse_retention:.4f} | {pt.ro_uniform_retention:.4f} | "
+            f"{pt.ro_detector_retention:.4f} | "
+            f"{pt.coding_delta:+.4f} | {pt.physics_delta:+.4f} | {pt.detect_delta:+.4f} |"
+        )
+
+    lines += [
+        "",
+        f"Ablation levels: {[pt.noise_level for pt in r93c.points]}",
+        "",
+        ablation_line,
+        "",
+        "## Stage 9.3d — Fair fight: KIVI + SnapKV on long context",
+        "",
+        "At T=307: KIVI-official compresses 275 tokens to 2-bit (group_size=32).",
+        "At T=307: SnapKV-r50 evicts 137 of 275 non-window positions (window=32).",
+        f"9.3d probes: {r93d.kivi_fp16_ctrl.accuracy:.0%} clean accuracy reference",
+        "",
+        "| method                | accuracy | bits/elem | storage% |",
+        "|----------------------|----------|-----------|----------|",
+        f"| KIVI_fp16_control    | {r93d.kivi_fp16_ctrl.accuracy:.4f}   | "
+        f"{r93d.kivi_fp16_ctrl.bits_per_kv_elem:9.2f} | "
+        f"{r93d.kivi_fp16_ctrl.storage_pct:.3f}    |",
+        f"| KIVI_2_official      | {r93d.kivi_2_official.accuracy:.4f}   | "
+        f"{r93d.kivi_2_official.bits_per_kv_elem:9.2f} | "
+        f"{r93d.kivi_2_official.storage_pct:.3f}    |",
+        f"| KIVI_2_small_g4      | {r93d.kivi_2_small.accuracy:.4f}   | "
+        f"{r93d.kivi_2_small.bits_per_kv_elem:9.2f} | "
+        f"{r93d.kivi_2_small.storage_pct:.3f}    |",
+        f"| SnapKV_r100_control  | {r93d.snapkv_r100_ctrl.accuracy:.4f}   | "
+        f"{r93d.snapkv_r100_ctrl.bits_per_kv_elem:9.2f} | "
+        f"{r93d.snapkv_r100_ctrl.storage_pct:.3f}    |",
+        f"| SnapKV_r50           | {r93d.snapkv_r50.accuracy:.4f}   | "
+        f"{r93d.snapkv_r50.bits_per_kv_elem:9.2f} | "
+        f"{r93d.snapkv_r50.storage_pct:.3f}    |",
+        f"| AEPK_B3_LC_noise02   | {r93d.aepk_lc.accuracy:.4f}   | "
+        f"{r93d.aepk_lc.bits_per_kv_elem:9.2f} | "
+        f"{r93d.aepk_lc.storage_pct:.3f}    |",
+        "",
+        f"control_ok: {r93d.control_ok}",
+        "",
+        dominance_line,
+        "",
+        "## Stage 9.3-LC-2 (erasure) — total page-loss regime (the make-or-break test)",
+        "",
+        "quant_noise (9.3a/b/c) barely dents LC accuracy, so the error regime",
+        "cannot demonstrate healing value. Erasure = total page loss (K,V",
+        "zeroed for the top-erased_k pages by attention_mass); RS recovery is",
+        "deterministically necessary here — a zeroed page cannot be",
+        "regenerated from context, only reconstructed from parity.",
+        "",
+        "damage_only: top-erased_k pages zeroed; NO recover_rs_erasure call.",
+        "recovery_on: encode_rs_erasure_group(num_parity=erased_k) BEFORE",
+        "  damage; recover_rs_erasure restores the erased pages bit-exact.",
+        "erased_k=0: control row — both retentions must equal 1.0.",
+        "",
+        "| erased_k | damage_only_ret | recovery_on_ret |",
+        "|----------|------------------|------------------|",
+    ]
+    for pt in r93e.points:
+        lines.append(
+            f"| {pt.erased_k} | {pt.damage_only_ret:.4f} | {pt.recovery_on_ret:.4f} |"
+        )
+
+    lines += [""] + erasure_lines
 
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:

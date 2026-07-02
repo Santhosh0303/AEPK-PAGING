@@ -67,3 +67,28 @@ At T=307: SnapKV-r50 evicts 137 of 275 non-window positions (window=32).
 control_ok: True
 
 LC_BASELINE_DOMINANCE: DOMINATES_SOME (vs_kivi=AEPK_WINS vs_snapkv=SNAPKV_NOT_APPLICABLE)
+
+## Stage 9.3-LC-2 (erasure) — total page-loss regime (the make-or-break test)
+
+quant_noise (9.3a/b/c) barely dents LC accuracy, so the error regime
+cannot demonstrate healing value. Erasure = total page loss (K,V
+zeroed for the top-erased_k pages by attention_mass); RS recovery is
+deterministically necessary here — a zeroed page cannot be
+regenerated from context, only reconstructed from parity.
+
+damage_only: top-erased_k pages zeroed; NO recover_rs_erasure call.
+recovery_on: encode_rs_erasure_group(num_parity=erased_k) BEFORE
+  damage; recover_rs_erasure restores the erased pages bit-exact.
+erased_k=0: control row — both retentions must equal 1.0.
+
+| erased_k | damage_only_ret | recovery_on_ret |
+|----------|------------------|------------------|
+| 0 | 1.0000 | 1.0000 |
+| 2 | 1.0526 | 1.0000 |
+| 4 | 1.0000 | 1.0000 |
+| 8 | 0.7632 | 1.0000 |
+
+ERASURE_HEAL: erased=0 damage_only_ret=1.0000 recovery_on_ret=1.0000
+ERASURE_HEAL: erased=2 damage_only_ret=1.0526 recovery_on_ret=1.0000
+ERASURE_HEAL: erased=4 damage_only_ret=1.0000 recovery_on_ret=1.0000
+ERASURE_HEAL: erased=8 damage_only_ret=0.7632 recovery_on_ret=1.0000

@@ -33,6 +33,8 @@ from aepk_paging.harness.phase9_3_lc import (
     LC93aResult,
     LC93cResult,
     LC93dResult,
+    LC93eResult,
+    LCErasurePoint,
     LONG_CONTEXT_PASSAGE,
     LC_NOISE_LEVELS,
     assert_token_lengths,
@@ -40,6 +42,7 @@ from aepk_paging.harness.phase9_3_lc import (
     run_phase9_3a,
     run_phase9_3c,
     run_phase9_3d,
+    run_phase9_3_erasure,
 )
 
 MODEL_ID = "Qwen/Qwen2.5-1.5B-Instruct"
@@ -264,7 +267,7 @@ class TestReport:
 
     def test_results_logged(self, iter_result):
         print(f"\n{'='*70}")
-        print("Phase 9.3a Long-Context Results (REDUCED GRID)")
+        print("Phase 9.3a Long-Context Results (FULL GRID)")
         print(f"{'='*70}")
         print(
             f"B0_lc={iter_result.b0_lc:.4f}  "
@@ -374,7 +377,7 @@ class TestAblation:
 
     def test_ablation_results_logged(self, ablation_result):
         print(f"\n{'='*70}")
-        print("Phase 9.3c Ablation Results (REDUCED GRID)")
+        print("Phase 9.3c Ablation Results (FULL GRID)")
         print(f"{'='*70}")
         print(
             f"Summary: coding={ablation_result.ablation_summary['coding']:+.4f}  "
@@ -523,7 +526,7 @@ class TestBaselines:
 
     def test_baseline_results_logged(self, baseline_result):
         print(f"\n{'='*70}")
-        print("Phase 9.3d Baseline Results (REDUCED GRID)")
+        print("Phase 9.3d Baseline Results (FULL GRID)")
         print(f"{'='*70}")
         print(f"B0_lc={baseline_result.b0_lc:.4f}")
         print(f"Dominance verdict: {baseline_result.dominance_verdict}")
@@ -539,3 +542,133 @@ class TestBaselines:
             baseline_result.aepk_lc,
         ]:
             print(f"{comp.name:<22} | {comp.accuracy:>8.4f} | {comp.bits_per_kv_elem:>9.2f} |")
+
+
+# ---------------------------------------------------------------------------
+# Stage 9.3-LC-2 (erasure) — total page-loss regime, the make-or-break test.
+# NOTE: TestErasure must come AFTER TestBaselines so that the 9.3d report
+# content is written before the erasure stage overwrites it with the final
+# full report (9.3a + 9.3b + 9.3c + 9.3d + erasure).
+# ---------------------------------------------------------------------------
+
+_ERASED_KS = [0, 2, 4, 8]
+
+
+@pytest.fixture(scope="module")
+def erasure_result(model_and_tok, iter_result, ablation_result, baseline_result):
+    """Run the erasure sweep (k=[0,2,4,8]) using prev_93a/93c/93d data."""
+    model, tok = model_and_tok
+    return run_phase9_3_erasure(
+        model, tok, DEVICE, DTYPE,
+        prev_93a=iter_result,
+        prev_93c=ablation_result,
+        prev_93d=baseline_result,
+        erased_ks=_ERASED_KS,
+        n_probes=_ITER_PROBES,
+    )
+
+
+class TestErasure:
+    """Stage 9.3-LC-2 erasure regime.
+
+    Gate (S9):
+      - ERASURE_HEAL verdict line asserted to EXIST per k; VALUE never asserted.
+      - erased_k=0 control: both damage_only_ret and recovery_on_ret == 1.0
+        (bit-exact — no pages erased).
+      - BUG-VS-FINDING: recovery_on at erased_k <= num_parity (== erased_k
+        here, so always at the bound) MUST be close to 1.0 (RS erasure
+        recovery is bit-exact per Phase 3). This test does NOT assert an
+        exact threshold value (S9: never assert ==/> a specific number for
+        a finding) — instead it is a printed diagnostic in
+        test_erasure_results_logged for human review before the self-
+        validation gate runs.
+    """
+
+    def test_erasure_result_type(self, erasure_result):
+        assert isinstance(erasure_result, LC93eResult)
+
+    def test_points_cover_all_ks(self, erasure_result):
+        found = {pt.erased_k for pt in erasure_result.points}
+        for k in _ERASED_KS:
+            assert k in found, f"erased_k={k} missing from erasure_result.points"
+
+    def test_points_are_correct_type(self, erasure_result):
+        for pt in erasure_result.points:
+            assert isinstance(pt, LCErasurePoint)
+
+    def test_retentions_are_float_nonnegative(self, erasure_result):
+        for pt in erasure_result.points:
+            assert isinstance(pt.damage_only_ret, float)
+            assert isinstance(pt.recovery_on_ret, float)
+            assert pt.damage_only_ret >= 0.0
+            assert pt.recovery_on_ret >= 0.0
+
+    def test_control_k0_damage_only_retention_equals_one(self, erasure_result):
+        """S9 gate (2): erased_k=0 is the control — no pages erased."""
+        pt = next(p for p in erasure_result.points if p.erased_k == 0)
+        assert pt.damage_only_ret == 1.0, (
+            f"erased_k=0 damage_only_ret={pt.damage_only_ret} != 1.0 "
+            "(control broken — a page was erased when erased_k=0)"
+        )
+
+    def test_control_k0_recovery_on_retention_equals_one(self, erasure_result):
+        """S9 gate (2): erased_k=0 is the control — no pages erased."""
+        pt = next(p for p in erasure_result.points if p.erased_k == 0)
+        assert pt.recovery_on_ret == 1.0, (
+            f"erased_k=0 recovery_on_ret={pt.recovery_on_ret} != 1.0 "
+            "(control broken — a page was erased when erased_k=0)"
+        )
+
+    def test_b0_lc_matches_iter(self, erasure_result, iter_result):
+        assert erasure_result.b0_lc == iter_result.b0_lc
+
+    def test_erasure_heal_line_exists_per_k(self, erasure_result):
+        with open(erasure_result.report_path, encoding="utf-8") as f:
+            content = f.read()
+        for k in _ERASED_KS:
+            assert f"ERASURE_HEAL: erased={k} " in content, (
+                f"ERASURE_HEAL line for erased={k} missing from REPORT_phase9_3_lc.md"
+            )
+
+    def test_lc_overrecovery_still_present(self, erasure_result):
+        with open(erasure_result.report_path, encoding="utf-8") as f:
+            content = f.read()
+        assert "LC_OVERRECOVERY:" in content
+
+    def test_ablation_still_present(self, erasure_result):
+        with open(erasure_result.report_path, encoding="utf-8") as f:
+            content = f.read()
+        assert "ABLATION:" in content
+
+    def test_lc_baseline_dominance_still_present(self, erasure_result):
+        with open(erasure_result.report_path, encoding="utf-8") as f:
+            content = f.read()
+        assert "LC_BASELINE_DOMINANCE:" in content
+
+    def test_report_byte_identical_on_erasure_rerun(
+        self, erasure_result, iter_result, ablation_result, baseline_result,
+    ):
+        """_write_full_report_93e must produce identical bytes twice."""
+        from aepk_paging.harness.phase9_3_lc import _write_full_report_93e
+        with open(erasure_result.report_path, encoding="utf-8") as f:
+            original = f.read()
+        _write_full_report_93e(
+            iter_result,
+            ablation_result,
+            baseline_result,
+            erasure_result,
+            erasure_result.report_path,
+        )
+        with open(erasure_result.report_path, encoding="utf-8") as f:
+            rerun = f.read()
+        assert original == rerun, "Final report is NOT byte-identical across two writes"
+
+    def test_erasure_results_logged(self, erasure_result):
+        print(f"\n{'='*70}")
+        print("Phase 9.3-LC-2 Erasure Results (FULL GRID)")
+        print(f"{'='*70}")
+        print(f"B0_lc={erasure_result.b0_lc:.4f}  probes={erasure_result.n_probes}")
+        print(f"{'erased_k':>8} | {'damage_only_ret':>16} | {'recovery_on_ret':>16}")
+        print("-" * 50)
+        for pt in erasure_result.points:
+            print(f"{pt.erased_k:>8} | {pt.damage_only_ret:>16.4f} | {pt.recovery_on_ret:>16.4f}")
