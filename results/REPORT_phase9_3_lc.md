@@ -6,6 +6,24 @@ Token length: min_T=307 max_T=311 (ALL >= 150)
 Seeds per cell: 2
 B0_lc: 0.8000  (freshly measured; NOT the short-prompt 0.330)
 
+## ⚠ PROVISIONAL — REDUCED GRID (HITL review 2026-07-02): DO NOT cite as findings
+This run used N=10 probes, 2 seeds. Retention is quantized to 1/16 — ONE probe
+moves any number by 0.0625. Two of the three verdicts are UNDERPOWERED, not real:
+- LC_OVERRECOVERY (damage_only=1.0 / recovery_on=0.9375): raw counts are
+  16/20 vs 15/20 — a ONE-probe difference. INCONCLUSIVE. Does NOT show "RS
+  doesn't help" or "RS hurts."
+- ABLATION coding=+0.0000 physics=+0.0000 detect=-0.0000: each Δ FLIPS SIGN
+  between noise 0.2 and 0.3 (±0.0625) and averages to 0. This is NOISE, NOT a
+  null result. At N=10 there is zero power to detect any brick effect.
+Only LC_BASELINE_DOMINANCE (bits/elem = deterministic) is trustworthy:
+AEPK 3.14 vs KIVI 5.20 bits at iso-accuracy 0.800 = a real compression win
+(but from residency/quant, NOT the self-healing thesis — the ablation cannot
+attribute it to coding/physics/detection at this N).
+REQUIRED next: re-run on the FULL grid (100 probes, 5 seeds) AND add an ERASURE
+regime test (total page loss, where recovery is deterministically necessary),
+because quant-noise barely dents long-context task accuracy (damage_only ~0.9-1.0)
+so the error regime cannot demonstrate healing value. See PROGRESS Phase 9.3-LC-2.
+
 ## Root problem (HITL 2026-07-02)
 9.1 and 9.2 used SHORT prompts (T=7-25):
   (a) RS over-recovers: few-token pages have tiny MSE → trivially restored.
