@@ -28,7 +28,14 @@ def attention_mass(page: KVPage, *, temperature: float = 1.0, top_fraction: floa
 def attention_distribution(page: KVPage, *, temperature: float = 1.0) -> np.ndarray:
     if temperature <= 0.0:
         raise ValueError("temperature must be positive")
-    scores = np.linalg.norm(page.K.astype(np.float32), axis=1) / np.float32(temperature)
+    # FLAW-A fix (2026-07-03): flatten per-token BEFORE the norm so this returns a
+    # true per-token [T] distribution. Real-model pages are 3D [T, num_kv_heads,
+    # head_dim]; the old axis=1 norm ran over the HEADS axis -> a [T, head_dim]
+    # matrix, not a distribution. reshape([T, -1]) is a strict no-op for 2D [T, F]
+    # pages, so simulator-phase behaviour is unchanged.
+    K = page.K.astype(np.float32)
+    per_token = K.reshape(K.shape[0], -1)
+    scores = np.linalg.norm(per_token, axis=1) / np.float32(temperature)
     shifted = scores - np.max(scores)
     weights = np.exp(shifted)
     return weights / np.sum(weights)
@@ -42,7 +49,16 @@ def attention_mass_detector(
     temperature: float = 1.0,
     top_fraction: float = 0.5,
 ) -> DetectorResult:
-    """Gibbs-fingerprint drift detector vs stored clean baseline."""
+    """Gibbs-fingerprint drift detector vs stored clean baseline.
+
+    FLAW-B NOTE (2026-07-03): `expected_mass` MUST be in the same units as
+    `attention_mass()` — i.e. a softmax mass in (0, 1]. Do NOT rely on the
+    `expected_mass=None` default with pages whose `page.attention_mass` was set to
+    a *different* statistic (e.g. real_model_adapter stores the mean key-norm, ~tens,
+    used by residency as a Boltzmann utility weight). Passing that as the baseline
+    makes `deviation ≈ the norm` -> every clean page flags. Real-model callers must
+    pass `expected_mass=attention_mass(clean_page)` (calibrated clean-vs-corrupt
+    comparison; see harness/phase9_cw.py)."""
     baseline = page.attention_mass if expected_mass is None else expected_mass
     current = attention_mass(page, temperature=temperature, top_fraction=top_fraction)
     deviation = abs(current - baseline)
