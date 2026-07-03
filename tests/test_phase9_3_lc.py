@@ -630,6 +630,14 @@ class TestErasure:
                 f"ERASURE_HEAL line for erased={k} missing from REPORT_phase9_3_lc.md"
             )
 
+    def test_erasure_interpretation_line_exists(self, erasure_result):
+        """S9 gate: ERASURE_INTERPRETATION line asserted to EXIST; verdict never asserted."""
+        with open(erasure_result.report_path, encoding="utf-8") as f:
+            content = f.read()
+        assert "ERASURE_INTERPRETATION:" in content, (
+            "ERASURE_INTERPRETATION line missing from REPORT_phase9_3_lc.md"
+        )
+
     def test_lc_overrecovery_still_present(self, erasure_result):
         with open(erasure_result.report_path, encoding="utf-8") as f:
             content = f.read()

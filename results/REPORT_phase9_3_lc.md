@@ -88,6 +88,8 @@ erased_k=0: control row — both retentions must equal 1.0.
 | 4 | 1.0000 | 1.0000 |
 | 8 | 0.7632 | 1.0000 |
 
+ERASURE_INTERPRETATION: SELF_HEALING_WORKS (damage_only DROPS at erased_k=8 (ret=0.7632) while recovery_on stays at 1.0000 — RS erasure recovery demonstrably restores accuracy that total page loss destroys.)
+
 ERASURE_HEAL: erased=0 damage_only_ret=1.0000 recovery_on_ret=1.0000
 ERASURE_HEAL: erased=2 damage_only_ret=1.0526 recovery_on_ret=1.0000
 ERASURE_HEAL: erased=4 damage_only_ret=1.0000 recovery_on_ret=1.0000

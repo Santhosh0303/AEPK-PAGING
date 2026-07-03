@@ -1091,7 +1091,40 @@ def _write_full_report_93e(
             f"| {pt.erased_k} | {pt.damage_only_ret:.4f} | {pt.recovery_on_ret:.4f} |"
         )
 
-    lines += [""] + erasure_lines
+    # Interpretation — S9 gate (5): runtime-derived from measured points, not
+    # tuned to force an outcome. GAP_THRESHOLD=0.05 is a "more than sampling
+    # noise" cutoff (9.3a's 95% CIs at n=100/5-seeds were ~0.01-0.02; a gap
+    # several times that is a real effect, not fluctuation) chosen for its
+    # generic statistical meaning, not fit to this specific result.
+    GAP_THRESHOLD = 0.05
+    nonzero_pts = [pt for pt in r93e.points if pt.erased_k > 0]
+    if nonzero_pts:
+        best = max(nonzero_pts, key=lambda pt: pt.recovery_on_ret - pt.damage_only_ret)
+        best_gap = best.recovery_on_ret - best.damage_only_ret
+        if best_gap >= GAP_THRESHOLD:
+            interp_verdict = "SELF_HEALING_WORKS"
+            interp_text = (
+                f"damage_only DROPS at erased_k={best.erased_k} "
+                f"(ret={best.damage_only_ret:.4f}) while recovery_on stays at "
+                f"{best.recovery_on_ret:.4f} — RS erasure recovery demonstrably "
+                "restores accuracy that total page loss destroys."
+            )
+        else:
+            interp_verdict = "NO_DEMONSTRABLE_VALUE"
+            interp_text = (
+                f"largest observed gap is only {best_gap:+.4f} at erased_k="
+                f"{best.erased_k} — even total page loss up to erased_k="
+                f"{max(pt.erased_k for pt in nonzero_pts)} does not measurably "
+                "hurt LC task accuracy, so recovery has no demonstrated value "
+                "at this scale."
+            )
+    else:
+        interp_verdict = "NO_DEMONSTRABLE_VALUE"
+        interp_text = "no erased_k>0 points measured."
+
+    erasure_interp_line = f"ERASURE_INTERPRETATION: {interp_verdict} ({interp_text})"
+
+    lines += ["", erasure_interp_line, ""] + erasure_lines
 
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
