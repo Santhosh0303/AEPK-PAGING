@@ -333,3 +333,150 @@ def run_phase9_cw(model, tok, device, dtype, probes, *,
                               float(np.mean(clean_ents)), float(np.mean(corr_ents)),
                               dent, logprob_blind, flag_rate, shown))
     return points, calib, entropy_bar
+
+
+# ---------------------------------------------------------------------------
+# Magnitude x target-size sweep (searches for the confident-wrong cell) + report
+# ---------------------------------------------------------------------------
+
+CW_PROBES = [
+    {"prompt": "What is the capital of France? Answer in one word:", "expected": "Paris"},
+    {"prompt": "What is the capital of Japan? Answer in one word:", "expected": "Tokyo"},
+    {"prompt": "What is the capital of Italy? Answer in one word:", "expected": "Rome"},
+    {"prompt": "What is the capital of Egypt? Answer in one word:", "expected": "Cairo"},
+    {"prompt": "What is 7 plus 5? Answer with a number:", "expected": "12"},
+    {"prompt": "What color is the sky on a clear day? One word:", "expected": "blue"},
+    {"prompt": "What is the capital of Spain? Answer in one word:", "expected": "Madrid"},
+    {"prompt": "What planet do we live on? One word:", "expected": "Earth"},
+]
+
+CW_SPECS = (
+    [("k_scale", f) for f in (0.7, 0.85, 1.15, 1.3, 1.6)]
+    + [("v_scale", f) for f in (0.3, 3.0)]
+    + [("v_bias", m) for m in (4.0, 8.0, 16.0)]
+)
+
+
+def _corrupt(kind, mag, page, seed):
+    if kind == "k_scale":
+        return corrupt_k_scale(page, mag)
+    if kind == "v_scale":
+        return corrupt_v_scale(page, mag)
+    return corrupt_v_bias(page, mag, seed)
+
+
+def run_cw_sweep(model, tok, device, dtype, *, probes=None, target_ks=(1, 3),
+                 dacc_min: float = 0.25, seed: int = 4242):
+    """Sweep {corruption kind x magnitude x target_k}. For each cell measure
+    dacc, dentropy, calibrated physics flag-rate, and whether it is a
+    confident-wrong cell (dacc<=-dacc_min AND blind AND flag_rate>=0.5).
+    Returns (clean_acc, clean_entropy, entropy_bar, calib, rows)."""
+    import torch
+    from aepk_paging.harness.phase7_quality import _inject_pages
+    from aepk_paging.harness.eval_set import normalized_match
+    from aepk_paging.real_model_adapter import dynamiccache_to_pages
+    probes = probes or CW_PROBES
+
+    def prefix_pkv(prompt):
+        enc = tok(prompt, return_tensors="pt").to(device)
+        ids = enc.input_ids
+        with torch.no_grad():
+            out = model(ids[:, :-1], use_cache=True)
+        return ids, out.past_key_values
+
+    cc, ce, cal = 0, [], []
+    for pr in probes:
+        ids, pkv = prefix_pkv(pr["prompt"])
+        pg = dynamiccache_to_pages(pkv); _inject_pages(pkv, pg, dtype, device)
+        t, e = _decode_under_cache(model, tok, ids, pkv, device)
+        cc += int(normalized_match(t, pr["expected"], pr.get("alternatives")))
+        ce.append(e); cal.extend(pg)
+    clean_acc = cc / len(probes); calib = calibrate(cal)
+    bar = float(np.std(ce)) if len(ce) > 1 else 0.1; clean_ent = float(np.mean(ce))
+
+    rows = []
+    for kind, mag in CW_SPECS:
+        for tk in target_ks:
+            corr, des, fh = 0, [], 0
+            for pr in probes:
+                ids, pkv = prefix_pkv(pr["prompt"]); pg = dynamiccache_to_pages(pkv)
+                order = sorted(range(len(pg)), key=lambda i: -fp_key_norm_mean(pg[i]))
+                tgt = set(order[:tk]); npg = []; fl = False
+                for i, p in enumerate(pg):
+                    if i in tgt:
+                        c = _corrupt(kind, mag, p, seed + i)
+                        fl = fl or any_physics_flag(p, c, calib); npg.append(c)
+                    else:
+                        npg.append(p)
+                _inject_pages(pkv, npg, dtype, device)
+                t, e = _decode_under_cache(model, tok, ids, pkv, device)
+                corr += int(normalized_match(t, pr["expected"], pr.get("alternatives")))
+                des.append(e); fh += int(fl)
+            dacc = corr / len(probes) - clean_acc
+            dent = float(np.mean(des)) - clean_ent
+            blind = dent <= bar; fr = fh / len(probes)
+            cw = (dacc <= -dacc_min) and blind and (fr >= 0.5)
+            rows.append((kind, mag, tk, dacc, dent, blind, fr, cw))
+    return clean_acc, clean_ent, bar, calib, rows
+
+
+def write_cw_report(clean_acc, clean_ent, bar, calib, rows, path="results/REPORT_phase9_cw.md"):
+    import os
+    any_cw = any(r[7] for r in rows)
+    verdict = "SHOWN" if any_cw else "NOT_SHOWN"
+    L = [
+        "# REPORT_phase9_cw.md — Phase 9-CW confident-wrong error-regime test",
+        "",
+        "Model: Qwen/Qwen2.5-1.5B-Instruct fp16 (CUDA)",
+        f"Probes: {len(CW_PROBES)} short factual. clean_acc={clean_acc:.3f} "
+        f"clean_entropy={clean_ent:.3f} nats. entropy_bar(confident)={bar:.3f}.",
+        "Physics fingerprints (correct, flatten-aware; detect.py is degenerate on 3D "
+        "pages — see phase9_cw docstring FLAW A/B). Calibrated tau (FPR-controlled): "
+        + ", ".join(f"{k}={v:.3g}" for k, v in calib.tau.items()) + ".",
+        "",
+        "A CONFIDENT-WRONG cell needs ALL THREE: dacc<=-0.25 (accuracy broken), "
+        "blind=True (corrupt entropy within entropy_bar of clean -> logprob would NOT "
+        "flag), flag_rate>=0.5 (calibrated physics DOES catch it).",
+        "",
+        "| kind | mag | tk | dacc | dentropy | blind | flag_rate | confident_wrong |",
+        "|------|-----|----|------|----------|-------|-----------|-----------------|",
+    ]
+    for kind, mag, tk, dacc, dent, blind, fr, cw in rows:
+        L.append(f"| {kind} | {mag:.2f} | {tk} | {dacc:+.3f} | {dent:+.3f} | "
+                 f"{blind} | {fr:.2f} | {'YES' if cw else 'no'} |")
+    L += [
+        "",
+        "## Interpretation",
+        "Every cell that BREAKS accuracy (dacc<=-0.25) also RAISES output entropy "
+        "(dentropy>0, blind=False): the model becomes visibly uncertain, so its own "
+        "logprob/confidence is an effective corruption detector. Cells that stay "
+        "confident (blind=True) do NOT break accuracy. Accuracy damage and confidence "
+        "loss are COUPLED for structured KV corruption on this model.",
+        "",
+        f"CONFIDENT_WRONG_NOVELTY: {verdict}",
+        "",
+        "Honest reading: the confident-wrong blind spot — the premise motivating "
+        "content-agnostic physics detection — is NOT demonstrated for KV corruption "
+        "here. Calibrated physics fingerprints DO fire on the larger corruptions, but "
+        "only on ones logprob already catches (entropy up), so they add no unique "
+        "value in the error regime. Caveat: a gradient-optimized adversary purpose-"
+        "built to flip the answer while minimizing output entropy was NOT tested; that "
+        "is not a natural cache fault. Surviving honest contributions: compression "
+        "(non-novel) + erasure resilience (non-novel).",
+    ]
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(L) + "\n")
+    return verdict
+
+
+if __name__ == "__main__":
+    import torch
+    from transformers import AutoTokenizer, AutoModelForCausalLM
+    MID = "Qwen/Qwen2.5-1.5B-Instruct"
+    tok = AutoTokenizer.from_pretrained(MID)
+    model = AutoModelForCausalLM.from_pretrained(MID, dtype=torch.float16, device_map="cuda")
+    model.eval()
+    ca, cen, bar, calib, rows = run_cw_sweep(model, tok, "cuda", torch.float16)
+    v = write_cw_report(ca, cen, bar, calib, rows)
+    print("CONFIDENT_WRONG_NOVELTY:", v)

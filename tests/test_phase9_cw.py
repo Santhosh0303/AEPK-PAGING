@@ -97,3 +97,20 @@ def test_token_entropy_orders_correctly():
     flat = np.array([1.0, 1.0, 1.0, 1.0], dtype=np.float32)
     assert token_entropy(peaked) < token_entropy(flat)
     assert abs(token_entropy(flat) - np.log(4)) < 1e-6
+
+
+def test_cw_report_verdict_line_is_harness_computed(tmp_path):
+    # verdict LINE EXISTS and is derived from the rows (never hardcoded)
+    from aepk_paging.harness.phase9_cw import write_cw_report
+    calib = calibrate(_clean_set())
+    # no confident-wrong cell -> NOT_SHOWN
+    rows_none = [("k_scale", 2.0, 3, -1.0, +2.5, False, 0.0, False)]
+    p = tmp_path / "cw_none.md"
+    v = write_cw_report(1.0, 0.4, 0.3, calib, rows_none, path=str(p))
+    txt = p.read_text(encoding="utf-8")
+    assert "CONFIDENT_WRONG_NOVELTY:" in txt
+    assert v == "NOT_SHOWN"
+    # a genuine confident-wrong cell -> SHOWN (verdict follows the data)
+    rows_shown = [("x", 1.0, 1, -0.5, +0.0, True, 1.0, True)]
+    p2 = tmp_path / "cw_shown.md"
+    assert write_cw_report(1.0, 0.4, 0.3, calib, rows_shown, path=str(p2)) == "SHOWN"
