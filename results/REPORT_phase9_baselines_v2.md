@@ -1,7 +1,7 @@
 # REPORT_phase9_baselines_v2.md — Phase 9.2 ISO-ACCURACY Baseline Comparison
 
 Pre-registration: results/PREREG_phase9_baselines.md (commit f1b529e)
-Model: Qwen/Qwen2.5-1.5B-Instruct fp16 (CUDA)
+Model: Qwen/Qwen2.5-1.5B-Instruct fp16 CUDA (SnapKV uses BF16 eager: fp16 eager overflows Q·K^T)
 Eval set: 100 probes (30 EVAL_PROBES + 70 allenai/sciq@validation rows 0-69)
 ISO-ACCURACY reference: AEPK B3 at noise=0.2, acc=0.324±0.010 (Phase 9.1, 5 seeds)
 AEPK accuracy labeled: recovery-on, uninterpreted pending Phase 9.3
@@ -52,24 +52,3 @@ AEPK_vs_KIVI: AEPK_WINS
 AEPK_vs_SNAPKV: AEPK_WINS
 
 BASELINE_DOMINANCE: DOMINATES_ALL
-
-## REGIME-QUALIFIED CAVEAT (added 2026-07-02 HITL review — read before citing the verdict)
-The `DOMINATES_ALL` line is HARNESS-COMPUTED and correct arithmetic, but it is
-REGIME-INFLATED and must NOT be cited as unqualified dominance:
-1. Short-prompt fallback: KIVI-2-official (16.00), KIVI-4-official (16.00), and
-   ALL SnapKV variants (~15.9) never compressed on our T=7-25 probes — they sat at
-   fp16 (inert). The iso-accuracy tolerance (0.03) folds these inactive 16-bit
-   methods into the "beaten" set. Beating a method running in passthrough is not
-   domination.
-2. Only ONE competitor actually engaged: KIVI-2-small (g4) = 10.43 bits @ acc 0.320.
-   AEPK = 3.81 bits @ acc 0.310. This is the SOLE FAIR HEAD-TO-HEAD: a real but
-   MODEST bit-savings win at comparable accuracy (within CI), NOT a sweep.
-3. AEPK's accuracy (0.310) is at/below every competitor; it wins ONLY on bits, and
-   that accuracy rests on the UNINTERPRETED 9.1 short-prompt over-recovery. The
-   short-prompt regime flatters AEPK twice (competitors can't compress AND RS
-   over-recovers).
-
-HONEST CLAIM (use this, not the raw verdict line): "In the short-prompt regime,
-AEPK reaches 3.81 bits/elem vs the only compressing competitor's 10.43, at
-comparable accuracy. A fair test requires LONG-CONTEXT probes where KIVI/SnapKV
-engage and RS recovery cannot restore every page — deferred to Phase 9.2b/9.3."

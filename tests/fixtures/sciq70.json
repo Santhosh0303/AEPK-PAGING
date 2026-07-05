@@ -1,0 +1,292 @@
+{
+  "provenance": {
+    "dataset": "allenai/sciq",
+    "split": "validation",
+    "row_ids": "0-69",
+    "prompt_field": "question",
+    "answer_field": "correct_answer",
+    "source": "vendored from aepk_paging/harness/phase9_accuracy.py _SCIQ_RAW (verified 2026-07-02 via standalone load_dataset)"
+  },
+  "probes": [
+    {
+      "question": "Who proposed the theory of evolution by natural selection?",
+      "answer": "darwin"
+    },
+    {
+      "question": "Each specific polypeptide has a unique linear sequence of which acids?",
+      "answer": "amino"
+    },
+    {
+      "question": "A frameshift mutation is a deletion or insertion of one or more of what that changes the reading frame of the base sequence?",
+      "answer": "nucleotides"
+    },
+    {
+      "question": "What is an area of land called that is wet for all or part of the year?",
+      "answer": "wetland"
+    },
+    {
+      "question": "Surface waters are heated by the radiation from?",
+      "answer": "the sun"
+    },
+    {
+      "question": "What are arteries, veins, and capillaries examples of?",
+      "answer": "blood vessels"
+    },
+    {
+      "question": "Biochemical reactions of metabolism include what two general categories?",
+      "answer": "catabolic and anabolic"
+    },
+    {
+      "question": "Compounds with aluminum and silicon are commonly found in the clay fractions of soils derived from what?",
+      "answer": "volcanic ash"
+    },
+    {
+      "question": "What organ has four major regions: the cerebrum, the diencephalon, the stem, and the cerebellum?",
+      "answer": "brain"
+    },
+    {
+      "question": "What can refer to a rope in a particular shape and a genetic structure involved in splicing?",
+      "answer": "lariat"
+    },
+    {
+      "question": "What is the ratio of the mass of an object to its volume?",
+      "answer": "density"
+    },
+    {
+      "question": "What is the most common type of anemia?",
+      "answer": "iron-def"
+    },
+    {
+      "question": "What stimulates milk production in mammals?",
+      "answer": "prolactin"
+    },
+    {
+      "question": "During telophase , the chromosomes begin to uncoil and form what?",
+      "answer": "chromatin"
+    },
+    {
+      "question": "The science dealing with the study of the atmosphere is known as what?",
+      "answer": "meteorology"
+    },
+    {
+      "question": "On what basis are the eras of the phanerozoic eon separated?",
+      "answer": "mass extinctions"
+    },
+    {
+      "question": "What type of response is generated when a stimulus is received by the nervous system?",
+      "answer": "a motor response"
+    },
+    {
+      "question": "Fluid in the pseudocoelom serves as a hydrostatic what?",
+      "answer": "skeleton"
+    },
+    {
+      "question": "How will global warming eliminate some islands and reduce the area of others?",
+      "answer": "raise sea levels"
+    },
+    {
+      "question": "What is the term for the secretion of saliva?",
+      "answer": "salivation"
+    },
+    {
+      "question": "What is the most common sti in the u.s.?",
+      "answer": "chlamydia"
+    },
+    {
+      "question": "What plant structures are the main avenues by which water evaporates from the sporophyte?",
+      "answer": "stomata"
+    },
+    {
+      "question": "Decomposers break down dead organisms into nutrients and what?",
+      "answer": "gases"
+    },
+    {
+      "question": "What is the term for the use of technology to treat genetic disorders or change organisms so they are more useful to people?",
+      "answer": "biotechnology"
+    },
+    {
+      "question": "What science specialty, with a set of like-named scientific laws, refers to the study of energy and energy transfer involving physical matter?",
+      "answer": "thermodynamics"
+    },
+    {
+      "question": "What type of tissue makes up the brain and the nerves that connect the brain to all parts of the body?",
+      "answer": "nervous tissue"
+    },
+    {
+      "question": "Periodic refers to something that does what?",
+      "answer": "repeat"
+    },
+    {
+      "question": "Blood is pumped from the heart, pushing open which valves?",
+      "answer": "pulmonary and aortic semilunar"
+    },
+    {
+      "question": "What term refers to a list of the elements that will replace the ones below them in single-replacement reactions?",
+      "answer": "activity series"
+    },
+    {
+      "question": "What cause many human diseases by killing host cells or disturbing their homeostasis?",
+      "answer": "viruses"
+    },
+    {
+      "question": "What two types of digestive systems do invertebrates have?",
+      "answer": "incomplete or complete"
+    },
+    {
+      "question": "What are ectothermic vertebrates that divide their time between freshwater and terrestrial habitats?",
+      "answer": "amphibians"
+    },
+    {
+      "question": "During exercise, the rate of blood returning to the heart does this?",
+      "answer": "increases"
+    },
+    {
+      "question": "What is the pattern of spacing among individuals within the boundaries of the population?",
+      "answer": "dispersion"
+    },
+    {
+      "question": "What level is a feeding position in a food chain or web?",
+      "answer": "trophic"
+    },
+    {
+      "question": "What do most of the noble gas elements have in common?",
+      "answer": "eight valence electrons"
+    },
+    {
+      "question": "What are the organisms that live in extreme conditions known as?",
+      "answer": "extremophiles"
+    },
+    {
+      "question": "Collision frequency is greater for what category of catalysts, which also tend to be more sensitive to temperature and more 'expensive'?",
+      "answer": "homogeneous"
+    },
+    {
+      "question": "What does the pull of the moon's gravity on earth cause?",
+      "answer": "tides"
+    },
+    {
+      "question": "A water molecule forms when oxygen (o) and _______  atoms react and are held together by covalent bonds?",
+      "answer": "hydrogen (h)"
+    },
+    {
+      "question": "What force makes objects seem lighter in water?",
+      "answer": "buoyant"
+    },
+    {
+      "question": "What  is the process by which the nucleus of a eukaryotic cell divides?",
+      "answer": "mitosis"
+    },
+    {
+      "question": "Iceland is made up of a series of?",
+      "answer": "volcanoes"
+    },
+    {
+      "question": "What type of organism does not need oxygen for growth and dies in its presence?",
+      "answer": "anaerobic"
+    },
+    {
+      "question": "What is the name of specialized organs that filter the lymph by percolation through a maze of connective tissue filled with white blood cells?",
+      "answer": "lymph nodes"
+    },
+    {
+      "question": "What are hydrocarbons most important use?",
+      "answer": "fuel"
+    },
+    {
+      "question": "What protects tissues of the central nervous system from changes in ph?",
+      "answer": "bicarbonate ions"
+    },
+    {
+      "question": "The air pressure is about 80% that of ________ pressure at sea level.",
+      "answer": "standard atmospheric"
+    },
+    {
+      "question": "Vertebrates - including fish, amphibians, reptiles, birds, and mammals - belong to what phylum?",
+      "answer": "chordata"
+    },
+    {
+      "question": "In our wildflower population, the pool of what remains constant from one generation to the next?",
+      "answer": "genes"
+    },
+    {
+      "question": "When a membrane uses energy to move a substance across it, what kind of transport is this?",
+      "answer": "active"
+    },
+    {
+      "question": "An electrostatic attraction between two ions that have exchanged what?",
+      "answer": "electrons"
+    },
+    {
+      "question": "During what part of a person's development are they generally at their physical peak?",
+      "answer": "early adulthood"
+    },
+    {
+      "question": "What type of movement involves sluggish segmentation, primarily in the transverse and descending colons?",
+      "answer": "haustral contraction"
+    },
+    {
+      "question": "Vertebrates evolved from primitive forms of which creature?",
+      "answer": "chordates"
+    },
+    {
+      "question": "What does the aqueous fluid between the chloroplast membrane and the grana known as?",
+      "answer": "stroma"
+    },
+    {
+      "question": "When a hypothesis is repeatedly confirmed, what can it then become?",
+      "answer": "theory"
+    },
+    {
+      "question": "Using a hammer to remove a nail changes both the direction and strength of the what?",
+      "answer": "applied force"
+    },
+    {
+      "question": "Through which process are plants able to make their own food?",
+      "answer": "photosynthesis"
+    },
+    {
+      "question": "What kind of waves are sound waves?",
+      "answer": "mechanical"
+    },
+    {
+      "question": "The protein without the prosthetic group is known as the what?",
+      "answer": "apoprotein"
+    },
+    {
+      "question": "What connections allow heterocysts to transport fixed nitrogen to neighboring cells and to receive carbohydrates?",
+      "answer": "intercellular"
+    },
+    {
+      "question": "The classes anthozoa, scyphozoa, cubozoa, and hydrozoa make up what phylum?",
+      "answer": "cnidaria"
+    },
+    {
+      "question": "Where does waste enter the large intestine from?",
+      "answer": "the small intestine"
+    },
+    {
+      "question": "What do different soil horizons show different amounts of?",
+      "answer": "alteration"
+    },
+    {
+      "question": "What is the main source of energy for your body?",
+      "answer": "carbohydrates"
+    },
+    {
+      "question": "What are thin, very small tail-like projections that extend outward from the cell body that allow protists to move?",
+      "answer": "cilia"
+    },
+    {
+      "question": "Earthquakes, which may occur on california's abundant faults, can also trigger what?",
+      "answer": "landslides"
+    },
+    {
+      "question": "In which way do particles of water move in deep water?",
+      "answer": "circles"
+    },
+    {
+      "question": "What is the name of the study of heat engines?",
+      "answer": "thermodynamics"
+    }
+  ]
+}

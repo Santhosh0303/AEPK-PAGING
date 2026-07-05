@@ -40,8 +40,6 @@ Curve monotone non-increasing: False
 Interpretation: accuracy-axis crossover may differ from NLL-axis crossover
 (Phase 8.2 NLL crossover = 0.2). Task accuracy and NLL measure different things.
 
-INTERPRETATION CAVEAT: retention~1.0 at all noise (incl 0.5, where ΔNLL=+1.26) is NOT yet a "noise doesn't hurt accuracy" finding — it is uninterpreted. Likely RS recover-worst-2 over-recovers on SHORT probe prompts (few KV pages) vs the long NLL held-out text. Resolve in Phase 9.3 damage-only ablation (strip RS recovery): if damage-only degrades with noise while recovery-on stays ~1.0 = "RS recovery restores accuracy" (positive); do NOT interpret this line before that control. Flat curve (non-monotone) is structural signal-erasure, not sampling noise — more seeds won't change it.
-
 COMPUTE CAVEAT: RS encode/decode CPU time not measured (same caveat as Phase 7.4/8.2).
 
 STATS: crossover=0.5 retention_ci=±0.0976 seeds=5

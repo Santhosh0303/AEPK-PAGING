@@ -11,3 +11,6 @@ dependencies = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+  "slow: long-running test (deselect with -m \"not slow\")",
+]

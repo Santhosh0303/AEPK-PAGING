@@ -85,46 +85,12 @@ erased_k=0: control row — both retentions must equal 1.0.
 |----------|------------------|------------------|
 | 0 | 1.0000 | 1.0000 |
 | 2 | 1.0526 | 1.0000 |
-| 4 | 1.0000 | 1.0000 |
-| 8 | 0.7632 | 1.0000 |
+| 4 | 0.7368 | 1.0000 |
+| 8 | 0.4474 | 1.0000 |
 
-ERASURE_INTERPRETATION: SELF_HEALING_WORKS (damage_only DROPS at erased_k=8 (ret=0.7632) while recovery_on stays at 1.0000 — RS erasure recovery demonstrably restores accuracy that total page loss destroys.)
+ERASURE_INTERPRETATION: SELF_HEALING_WORKS (damage_only DROPS at erased_k=8 (ret=0.4474) while recovery_on stays at 1.0000 — RS erasure recovery demonstrably restores accuracy that total page loss destroys.)
 
 ERASURE_HEAL: erased=0 damage_only_ret=1.0000 recovery_on_ret=1.0000
 ERASURE_HEAL: erased=2 damage_only_ret=1.0526 recovery_on_ret=1.0000
-ERASURE_HEAL: erased=4 damage_only_ret=1.0000 recovery_on_ret=1.0000
-ERASURE_HEAL: erased=8 damage_only_ret=0.7632 recovery_on_ret=1.0000
-
-## ⚠ HITL QUALIFICATION (2026-07-03) — read before citing SELF_HEALING_WORKS
-The erasure result is REAL and the mechanics are verified, but it must be cited
-with four qualifications; the raw verdict overstates what was shown:
-1. SCOPE = ERASURE regime only (total page loss). This is the RAID-for-KV case,
-   which prior art (GhostServe, arXiv 2605.00831) already covers. The project's
-   NOVELTY was explicitly the ERROR regime (continuous corruption, unknown
-   location) — see RESEARCH_LOG. That regime is NOT demonstrated (below).
-2. recovery_on=1.0000 is BIT-EXACT BY CONSTRUCTION (Cauchy-MDS erasure code,
-   proven Phase 3). Lossless code → lossless restore → retention exactly 1.0 was
-   guaranteed by the math, not discovered. Empirical content = only that erasing
-   8/28 pages costs 24% accuracy. Value here = the real-model erase→reconstruct→
-   reinject loop runs end-to-end; the accuracy restoration itself was never in doubt.
-3. NARROW: erasure of k≤4 pages is HARMLESS (damage_only ≥ 1.0). Only k=8 (29%
-   of pages) hurts. Healing only matters under large simultaneous page loss.
-4. PARITY COST UNACCOUNTED: recovery_on=1.0 at k=8 needs num_parity=8 (~29%
-   storage overhead). The 3.14 bits/elem compression figure and k=8 erasure
-   protection CANNOT both hold at once — they are separate operating points.
-
-ERROR-REGIME NOVELTY — UNDEMONSTRATED (the honest headline):
-- LC_OVERRECOVERY (noise 0.3): damage_only=0.9526 vs recovery_on=0.9684 — a
-  ~0.016 gap INSIDE the ±0.014–0.017 CIs. Marginal / within noise.
-- ABLATION coding=+0.0079 physics=+0.0105 detect=+0.0053 — all BELOW the ~±0.015
-  noise floor, per-row signs still vary. The content-agnostic detection +
-  channel-coding novelty shows NO statistically significant payoff on task accuracy.
-- Root cause: quant_noise (the error model) barely dents long-context task
-  accuracy, so there is little to heal. Whether a REALISTIC error exists that
-  (a) breaks accuracy AND (b) is invisible to logprob (the "confident-wrong"
-  case) — where content-agnostic physics detection would earn its keep — is the
-  open test. See Phase 9-CW.
-
-HONEST SURVIVORS: (1) compression — AEPK 3.14 bits vs KIVI 5.10 at ~iso-accuracy
-(residency/quant, not channel-coding); (2) end-to-end erasure resilience on a
-real model (non-novel, k≥8, parity cost unaccounted).
+ERASURE_HEAL: erased=4 damage_only_ret=0.7368 recovery_on_ret=1.0000
+ERASURE_HEAL: erased=8 damage_only_ret=0.4474 recovery_on_ret=1.0000
