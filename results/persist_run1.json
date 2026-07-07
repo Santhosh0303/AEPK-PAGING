@@ -1,0 +1,10 @@
+{
+  "baseline_acc": 0.0,
+  "clean_acc": 1.0,
+  "detected": true,
+  "detection_rate": 1.0,
+  "healed_acc": 1.0,
+  "healed_exact": true,
+  "n_cc": 24,
+  "roundtrip_exact": true
+}

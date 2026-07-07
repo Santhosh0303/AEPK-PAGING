@@ -51,3 +51,29 @@ Zero edits to Phase 2-5 source. New harness `phase10_healcost.py` reuses
 `phase9_cw.fp_key_norm_mean`, and the live-heal `GROUP_SIZE`/`NUM_PARITY`. The median/IQR/overhead/
 tolerance math is deterministic and CPU-tested on synthetic timings + synthetic KV pages
 (`tests/test_phase10_healcost.py`). Report: results/REPORT_phase10_healcost.md.
+
+## Step-23 ADDENDUM — encode off the hot path (async parity build), written BEFORE the timing run
+
+locked: 2026-07-06T17:11:50Z (UTC)
+harness: phase10_healcost.py NEW section (run_encodeasync / write_encodeasync_report /
+groups_closed / amortized_overhead_pct) — existing measured fns UNEDITED. tests:
+tests/test_phase10_encodeasync.py (CPU-tested BEFORE GPU: scheduling math, overhead computation,
+deterministic parity byte-identity, tolerance gate, line-exists).
+Design (FIXED here): Qwen2.5-1.5B fp16. A parity group closes every GROUP_SIZE=4 decoded tokens
+(NUM_PARITY=1). Three schedules, per-token latency = arm wall-clock / n_tokens, N_TOKENS=200
+decoded tokens per arm (>=200):
+  - decode_only: pure single-token decode loop, no parity (the baseline hot path).
+  - SYNC: identical loop, parity encode executed INLINE every group_size tokens.
+  - ASYNC: identical schedule, encode dispatched to a worker thread overlapped with the GPU
+    decode step (CPU GF(2^8) parity build hidden behind GPU decode).
+Correctness: the ASYNC-built parity bytes MUST be byte-identical to the SYNC-built parity for the
+same pages (encode is deterministic) — parity_bytes_exact gate.
+Verdict line (runtime f-string): ENCODE_ASYNC: sync_ms_per_tok=<s> async_ms_per_tok=<a>
+overhead_pct=<p> parity_bytes_exact=<bool>, where overhead_pct = residual async per-token overhead
+vs decode_only (100*(async-decode_only)/decode_only).
+Gate: suite run TWICE; run-2 per-token medians within +/-20% of run-1 for sync AND async (timing
+exemption — latencies never reproduce byte-exactly); parity bytes EXACT-MATCH across arms and runs.
+ACCEPT: ENCODE_ASYNC line present; parity bytes exact across arms and runs; run-2 within tolerance;
+ALLOWED to land anywhere (async overhead may not vanish — thread/GIL/stream sync — reported as-is;
+MICROBENCHMARK scope, not serving throughput). Zero Phase 2-5 diff (healcost is a Phase 10 harness;
+the frozen Phase 2-5 modules are untouched).

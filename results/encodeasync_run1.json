@@ -1,0 +1,10 @@
+{
+  "async_ms_per_tok": 77.3230384994531,
+  "decode_only_ms_per_tok": 53.65816649980843,
+  "group_size": 4,
+  "groups_closed": 50,
+  "n_tokens": 200,
+  "parity_bytes_exact": true,
+  "parity_bytes_len": 626688,
+  "sync_ms_per_tok": 89.86119200009853
+}

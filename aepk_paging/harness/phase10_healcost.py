@@ -200,6 +200,173 @@ def write_healcost_report(run1: dict, run2: dict, path="results/REPORT_phase10_h
     return heal_ms, recompute_ms, ratio, ov, all_within, bytes_exact
 
 
+# ============================================================================
+# Step 23 — encode OFF the hot path (async/overlapped parity build). New section;
+# nothing above is edited. A parity group closes every GROUP_SIZE decoded tokens;
+# the SYNC arm encodes inline, the ASYNC arm runs encode in a worker thread while
+# decode (GPU) continues, so the CPU parity build overlaps the GPU decode step.
+# ============================================================================
+
+ASYNC_TOKENS = 200          # decoded tokens per arm (>= 200)
+
+
+def groups_closed(n_tokens: int, group_size: int = GROUP_SIZE) -> int:
+    """Number of parity encodes triggered by decoding n_tokens (one per closed group)."""
+    return int(n_tokens) // int(group_size)
+
+
+def amortized_overhead_pct(baseline_ms: float, arm_ms: float) -> float:
+    """Residual per-token overhead of `arm` vs a pure-decode `baseline`, as a percentage. Negative
+    means the arm is faster than baseline (measurement jitter or fully hidden work)."""
+    if not (baseline_ms == baseline_ms and arm_ms == arm_ms):    # nan guard
+        return float("nan")
+    if baseline_ms <= 0:
+        return float("nan")
+    return 100.0 * (arm_ms - baseline_ms) / baseline_ms
+
+
+def run_encodeasync(model, tok, device, dtype, *, probe, n_tokens: int = ASYNC_TOKENS,
+                    group_size: int = GROUP_SIZE) -> dict:
+    """Measure per-token decode latency under three schedules on real Qwen pages:
+    decode_only (no parity), SYNC (encode inline every group_size tokens), ASYNC (encode in a
+    worker thread overlapped with decode). Also returns the sync/async parity bytes for the
+    byte-identical correctness check. Deterministic parity; timings are wall-clock."""
+    import threading
+
+    import torch
+    from aepk_paging.harness.phase9_cw import fp_key_norm_mean
+    from aepk_paging.real_model_adapter import dynamiccache_to_pages
+
+    enc = tok(probe["prompt"], return_tensors="pt").to(device)
+    ids = enc.input_ids
+
+    # fixed representative parity group (top-influence sibling pages), from the prompt prefill
+    with torch.no_grad():
+        out0 = model(ids[:, :-1], use_cache=True)
+    pages = dynamiccache_to_pages(out0.past_key_values)
+    order = sorted(range(len(pages)), key=lambda i: -fp_key_norm_mean(pages[i]))
+    group_pages = [pages[i] for i in order[:group_size]]
+
+    def encode_parity():
+        return encode_rs_erasure_group(group_pages, NUM_PARITY).parity_bytes
+
+    def fresh_decode_state():
+        with torch.no_grad():
+            o = model(ids, use_cache=True)
+        if device != "cpu":
+            torch.cuda.synchronize()
+        return o.past_key_values, o.logits[:, -1:].argmax(-1)
+
+    def run_arm(mode):
+        pkv, cur = fresh_decode_state()
+        threads = []
+        last_parity = {}
+
+        def step():
+            nonlocal pkv, cur
+            with torch.no_grad():
+                o = model(cur, past_key_values=pkv, use_cache=True)
+            pkv = o.past_key_values
+            cur = o.logits[:, -1:].argmax(-1)
+            if device != "cpu":
+                torch.cuda.synchronize()
+
+        t0 = time.perf_counter()
+        for i in range(n_tokens):
+            step()
+            if mode != "decode_only" and (i + 1) % group_size == 0:
+                if mode == "async":
+                    th = threading.Thread(
+                        target=lambda: last_parity.__setitem__("p", encode_parity()))
+                    th.start()
+                    threads.append(th)
+                else:                                    # sync: inline on the hot path
+                    last_parity["p"] = encode_parity()
+        for th in threads:
+            th.join()
+        total_ms = (time.perf_counter() - t0) * 1e3
+        return total_ms / n_tokens, last_parity.get("p")
+
+    decode_only_ms, _ = run_arm("decode_only")
+    sync_ms, sync_parity = run_arm("sync")
+    async_ms, async_parity = run_arm("async")
+
+    parity_bytes_exact = bool(
+        sync_parity is not None and async_parity is not None
+        and np.array_equal(sync_parity, async_parity)
+        and np.array_equal(sync_parity, encode_parity()))
+
+    return {
+        "n_tokens": int(n_tokens), "group_size": int(group_size),
+        "groups_closed": groups_closed(n_tokens, group_size),
+        "decode_only_ms_per_tok": float(decode_only_ms),
+        "sync_ms_per_tok": float(sync_ms),
+        "async_ms_per_tok": float(async_ms),
+        "parity_bytes_len": int(sync_parity.size) if sync_parity is not None else 0,
+        "parity_bytes_exact": parity_bytes_exact,
+    }
+
+
+def write_encodeasync_report(run1: dict, run2: dict,
+                             path="results/REPORT_phase10_encodeasync.md"):
+    """ENCODE_ASYNC report from two timing runs. overhead_pct = residual async per-token overhead
+    vs pure decode. Latency gate = run-2 within +/-20% of run-1; parity bytes exact across arms
+    and runs. Runtime f-string verdict."""
+    import os
+
+    sync_within = within_tolerance(run1["sync_ms_per_tok"], run2["sync_ms_per_tok"])
+    async_within = within_tolerance(run1["async_ms_per_tok"], run2["async_ms_per_tok"])
+    all_within = sync_within and async_within
+    bytes_exact = bool(run1["parity_bytes_exact"] and run2["parity_bytes_exact"])
+    overhead = amortized_overhead_pct(run1["decode_only_ms_per_tok"], run1["async_ms_per_tok"])
+    sync_overhead = amortized_overhead_pct(run1["decode_only_ms_per_tok"], run1["sync_ms_per_tok"])
+
+    L = [
+        "# REPORT_phase10_encodeasync.md — Phase 10 step 23 encode off the hot path",
+        "",
+        "Model: Qwen/Qwen2.5-1.5B-Instruct fp16 (CUDA). A parity group closes every "
+        f"GROUP_SIZE={GROUP_SIZE} decoded tokens (NUM_PARITY={NUM_PARITY}); "
+        f"{run1['groups_closed']} encodes over {run1['n_tokens']} tokens. Three schedules timed: "
+        "decode_only (no parity), SYNC (encode inline on the hot path), ASYNC (encode in a worker "
+        "thread overlapped with the GPU decode step). Per-token latency = arm wall-clock / "
+        "n_tokens. Suite run TWICE; PREREG gate = run-2 within +/-20% of run-1 (timings never "
+        "reproduce byte-exactly). Parity BYTES are exact-match across arms and runs (async overlap "
+        "must not change the encoded parity).",
+        "",
+        "| schedule | run1 ms/tok | run2 ms/tok | within +/-20% |",
+        "|----------|-------------|-------------|---------------|",
+        f"| decode_only | {run1['decode_only_ms_per_tok']:.4f} | "
+        f"{run2['decode_only_ms_per_tok']:.4f} | - |",
+        f"| sync | {run1['sync_ms_per_tok']:.4f} | {run2['sync_ms_per_tok']:.4f} | {sync_within} |",
+        f"| async | {run1['async_ms_per_tok']:.4f} | {run2['async_ms_per_tok']:.4f} | "
+        f"{async_within} |",
+        "",
+        f"SYNC amortized overhead vs decode_only = {sync_overhead:.2f}%; ASYNC residual overhead = "
+        f"{overhead:.2f}%. parity_bytes_len={run1['parity_bytes_len']} exact={bytes_exact}.",
+        "",
+        "## Interpretation",
+        "SYNC pays the parity build inline, so its per-token latency carries the amortized encode "
+        "cost (sync overhead above). ASYNC dispatches the encode (CPU: GF(2^8) linear algebra over "
+        "page bytes) to a worker thread while the GPU decode step proceeds, hiding it — the "
+        "residual async overhead is what remains on the hot path after overlap. The encode is "
+        "deterministic, so the async-built parity is byte-identical to the sync-built parity "
+        "(correctness of the overlap). ALLOWED to land anywhere: if the async overhead does not "
+        "vanish (thread/stream sync, GIL contention), it is reported as-is — MICROBENCHMARK scope, "
+        "not serving throughput.",
+        "",
+        f"ENCODE_ASYNC: sync_ms_per_tok={run1['sync_ms_per_tok']:.4f} "
+        f"async_ms_per_tok={run1['async_ms_per_tok']:.4f} overhead_pct={overhead:.2f} "
+        f"parity_bytes_exact={bytes_exact}",
+        "",
+        f"DETERMINISM: sync_within={sync_within} async_within={async_within} "
+        f"all_within_tol={all_within} parity_bytes_exact={bytes_exact}.",
+    ]
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(L) + "\n")
+    return run1["sync_ms_per_tok"], run1["async_ms_per_tok"], overhead, bytes_exact, all_within
+
+
 if __name__ == "__main__":
     import torch
     from transformers import AutoTokenizer, AutoModelForCausalLM
